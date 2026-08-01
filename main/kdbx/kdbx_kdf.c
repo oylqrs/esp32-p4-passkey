@@ -69,10 +69,11 @@ esp_err_t kdbx_derive_aes_kdf_master_key(const kdbx_header_t *header,
     uint8_t block[32];
     memcpy(block, composite_key, sizeof(block));
     step_start_us = kdbx_now_us();
+    ESP_LOGI(TAG, "KDBX AES-KDF transform start rounds=%llu", (unsigned long long)header->kdf_rounds);
     for (uint64_t i = 0; i < header->kdf_rounds; i++) {
         mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, block, block);
         mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, block + 16, block + 16);
-        if ((i & 0x3fff) == 0x3fff) {
+        if ((i & 0x03ff) == 0x03ff) {
             kdbx_crypto_cooperate();
         }
     }

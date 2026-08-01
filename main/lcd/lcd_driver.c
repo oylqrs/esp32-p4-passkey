@@ -34,7 +34,7 @@ static const char *TAG = "st7701sn_lcd";
 #define LCD_BACKLIGHT_LEDC_DUTY_RES     LEDC_TIMER_10_BIT
 #define LCD_BACKLIGHT_LEDC_DUTY_MAX     ((1 << 10) - 1)
 #define LCD_BACKLIGHT_LEDC_FREQ_HZ      5000
-#define LCD_RESET_GPIO                  GPIO_NUM_37
+#define LCD_RESET_GPIO                  GPIO_NUM_1
 
 typedef struct {
     uint8_t cmd;
@@ -42,6 +42,16 @@ typedef struct {
     size_t data_len;
     uint16_t delay_ms;
 } lcd_init_cmd_t;
+
+static void lcd_check_mipi_step(const char *step, esp_err_t ret)
+{
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "MIPI check OK: %s", step);
+    } else {
+        ESP_LOGE(TAG, "MIPI check failed: %s, err=%s", step, esp_err_to_name(ret));
+    }
+    ESP_ERROR_CHECK(ret);
+}
 
 static void lcd_backlight_init(void)
 {
@@ -81,28 +91,41 @@ static void lcd_reset_init_and_release(void)
 {
     const gpio_config_t reset_config = {
         .pin_bit_mask = 1ULL << LCD_RESET_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+       // .mode = GPIO_MODE_OUTPUT,
+       .mode = GPIO_MODE_INPUT_OUTPUT ,
+       .pull_up_en = GPIO_PULLUP_ENABLE,   // 打开内部上拉
+       // .pull_up_en = GPIO_PULLUP_DISABLE,
+       // .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      // .pull_down_en = GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_DISABLE,
+
+ 
+
     };
-    ESP_ERROR_CHECK(gpio_config(&reset_config));
-    ESP_LOGI(TAG, "LCD reset GPIO37 configured, readback=%d", gpio_get_level(LCD_RESET_GPIO));
+    gpio_config(&reset_config);
+    //gpio_set_input_enabled(GPIO_NUM_1, true); // 关键：开启输入采样通路
 
-    ESP_LOGI(TAG, "Precharge LCD reset on GPIO37 high");
-    ESP_ERROR_CHECK(gpio_set_level(LCD_RESET_GPIO, 1));
-    ESP_LOGI(TAG, "LCD reset GPIO37 precharge high, readback=%d", gpio_get_level(LCD_RESET_GPIO));
-    vTaskDelay(pdMS_TO_TICKS(1));
+    ESP_LOGI(TAG, "LCD reset GPIO%d configured, readback=%d", LCD_RESET_GPIO, gpio_get_level(LCD_RESET_GPIO));
+    vTaskDelay(pdMS_TO_TICKS(15));
+    ESP_LOGI(TAG, "Precharge LCD reset on GPIO%d high", LCD_RESET_GPIO);
+    gpio_set_level(LCD_RESET_GPIO, 1);
+    ESP_LOGI(TAG, "LCD reset GPIO%d precharge high, readback=%d", LCD_RESET_GPIO, gpio_get_level(LCD_RESET_GPIO));
+    vTaskDelay(pdMS_TO_TICKS(12));
+    //vTaskDelay(pdMS_TO_TICKS(1));
 
-    ESP_LOGI(TAG, "Assert LCD reset on GPIO37");
-    ESP_ERROR_CHECK(gpio_set_level(LCD_RESET_GPIO, 0));
-    ESP_LOGI(TAG, "LCD reset GPIO37 after assert, readback=%d", gpio_get_level(LCD_RESET_GPIO));
+    ESP_LOGI(TAG, "Assert LCD reset on GPIO%d", LCD_RESET_GPIO);
+    gpio_set_level(LCD_RESET_GPIO, 0);
+    ESP_LOGI(TAG, "LCD reset GPIO%d after assert, readback=%d", LCD_RESET_GPIO, gpio_get_level(LCD_RESET_GPIO));
+    vTaskDelay(pdMS_TO_TICKS(30));
+    //vTaskDelay(pdMS_TO_TICKS(5));
+
+    ESP_LOGI(TAG, "Release LCD reset on GPIO%d", LCD_RESET_GPIO);
+    gpio_set_level(LCD_RESET_GPIO, 1);
+    ESP_LOGI(TAG, "LCD reset GPIO%d after release, readback=%d", LCD_RESET_GPIO, gpio_get_level(LCD_RESET_GPIO));
+    if (gpio_get_level(LCD_RESET_GPIO) == 0) {
+        ESP_LOGW(TAG, "LCD reset GPIO%d is still low after release; check pin mapping or external pull-down", LCD_RESET_GPIO);
+    }
     vTaskDelay(pdMS_TO_TICKS(5));
-
-    ESP_LOGI(TAG, "Release LCD reset on GPIO37");
-    ESP_ERROR_CHECK(gpio_set_level(LCD_RESET_GPIO, 1));
-    ESP_LOGI(TAG, "LCD reset GPIO37 after release, readback=%d", gpio_get_level(LCD_RESET_GPIO));
-    vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 static void lcd_enable_dsi_phy_power(void)
@@ -194,7 +217,15 @@ static void lcd_init_st7701sn(esp_lcd_panel_io_handle_t io)
 
 esp_lcd_panel_handle_t lcd_driver_init(void)
 {
+    //lcd_reset_init_and_release();
+     vTaskDelay(pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Initialize ST7701SN 480x640 MIPI display with ESP-IDF DSI flow");
+    ESP_LOGI(TAG,
+             "MIPI DSI config: lanes=%d lane_bitrate=%dMbps aggregate=%dMbps dpi_clk=%dMHz color=RGB565",
+             LCD_MIPI_DSI_LANE_NUM,
+             LCD_MIPI_DSI_LANE_BITRATE_MBPS,
+             LCD_MIPI_DSI_LANE_NUM * LCD_MIPI_DSI_LANE_BITRATE_MBPS,
+             LCD_MIPI_DPI_CLK_MHZ);
 
     lcd_backlight_init();
     lcd_driver_set_backlight(0);
@@ -207,7 +238,8 @@ esp_lcd_panel_handle_t lcd_driver_init(void)
         .lane_bit_rate_mbps = LCD_MIPI_DSI_LANE_BITRATE_MBPS,
     };
     ESP_LOGI(TAG, "Create MIPI DSI bus");
-    ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus));
+    lcd_check_mipi_step("create DSI bus", esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus));
+    ESP_LOGI(TAG, "MIPI DSI bus handle=%p", mipi_dsi_bus);
 
     esp_lcd_panel_io_handle_t mipi_dbi_io = NULL;
     const esp_lcd_dbi_io_config_t dbi_config = {
@@ -216,7 +248,12 @@ esp_lcd_panel_handle_t lcd_driver_init(void)
         .lcd_param_bits = 8,
     };
     ESP_LOGI(TAG, "Create MIPI DBI command IO");
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_dbi(mipi_dsi_bus, &dbi_config, &mipi_dbi_io));
+    lcd_check_mipi_step("create DBI command channel", esp_lcd_new_panel_io_dbi(mipi_dsi_bus, &dbi_config, &mipi_dbi_io));
+    ESP_LOGI(TAG, "MIPI DBI IO handle=%p vc=%d cmd_bits=%d param_bits=%d",
+             mipi_dbi_io,
+             dbi_config.virtual_channel,
+             dbi_config.lcd_cmd_bits,
+             dbi_config.lcd_param_bits);
     lcd_dsi_disable_command_ack(mipi_dsi_bus);
 
     esp_lcd_panel_handle_t dpi_panel = NULL;
@@ -241,27 +278,39 @@ esp_lcd_panel_handle_t lcd_driver_init(void)
             .disable_lp = 1,
         },
     };
+    ESP_LOGI(TAG,
+             "MIPI DPI timing: %ux%u hbp=%u hpw=%u hfp=%u vbp=%u vpw=%u vfp=%u fb=%u disable_lp=%u",
+             (unsigned)dpi_config.video_timing.h_size,
+             (unsigned)dpi_config.video_timing.v_size,
+             (unsigned)dpi_config.video_timing.hsync_back_porch,
+             (unsigned)dpi_config.video_timing.hsync_pulse_width,
+             (unsigned)dpi_config.video_timing.hsync_front_porch,
+             (unsigned)dpi_config.video_timing.vsync_back_porch,
+             (unsigned)dpi_config.video_timing.vsync_pulse_width,
+             (unsigned)dpi_config.video_timing.vsync_front_porch,
+             (unsigned)dpi_config.num_fbs,
+             (unsigned)dpi_config.flags.disable_lp);
     ESP_LOGI(TAG, "Create MIPI DPI panel");
-    ESP_ERROR_CHECK(esp_lcd_new_panel_dpi(mipi_dsi_bus, &dpi_config, &dpi_panel));
-    ESP_LOGI(TAG, "MIPI DPI panel created");
+    lcd_check_mipi_step("create DPI video panel", esp_lcd_new_panel_dpi(mipi_dsi_bus, &dpi_config, &dpi_panel));
+    ESP_LOGI(TAG, "MIPI DPI panel handle=%p", dpi_panel);
 
     lcd_reset_init_and_release();
     lcd_init_st7701sn(mipi_dbi_io);
 
     ESP_LOGI(TAG, "Start MIPI DPI panel init");
-    ESP_ERROR_CHECK(esp_lcd_panel_init(dpi_panel));
+    lcd_check_mipi_step("init DPI panel and start video stream", esp_lcd_panel_init(dpi_panel));
     ESP_LOGI(TAG, "MIPI DPI panel init done, video stream should be enabled");
 
 #if LCD_USE_DSI_TEST_PATTERN
     ESP_LOGI(TAG, "Show MIPI DSI vertical color bar test pattern");
     ESP_ERROR_CHECK(esp_lcd_dpi_panel_set_pattern(dpi_panel, MIPI_DSI_PATTERN_BAR_VERTICAL));
-    lcd_driver_set_backlight(50);
+    lcd_driver_set_backlight(80);
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 #endif
 
-    lcd_driver_set_backlight(50);
+    lcd_driver_set_backlight(80);
     ESP_LOGI(TAG, "LCD backlight enabled");
 
     return dpi_panel;

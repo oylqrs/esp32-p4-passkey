@@ -22,29 +22,24 @@ typedef struct {
     size_t max_entries;
 } kdbx_entry_sink_t;
 
-static esp_err_t append_bytes(uint8_t **buffer, size_t *len, size_t *capacity, const uint8_t *data, size_t data_len)
+static esp_err_t reserve_bytes(uint8_t **buffer, size_t *capacity, size_t needed_len)
 {
-    if (data_len == 0) {
+    if (needed_len <= *capacity) {
         return ESP_OK;
     }
 
-    if (*len + data_len > *capacity) {
-        size_t new_capacity = *capacity == 0 ? 1024 : *capacity;
-        while (new_capacity < *len + data_len) {
-            new_capacity *= 2;
-        }
-
-        uint8_t *new_buffer = realloc(*buffer, new_capacity);
-        if (!new_buffer) {
-            return ESP_ERR_NO_MEM;
-        }
-
-        *buffer = new_buffer;
-        *capacity = new_capacity;
+    size_t new_capacity = *capacity == 0 ? 1024 : *capacity;
+    while (new_capacity < needed_len) {
+        new_capacity *= 2;
     }
 
-    memcpy(*buffer + *len, data, data_len);
-    *len += data_len;
+    uint8_t *new_buffer = realloc(*buffer, new_capacity);
+    if (!new_buffer) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    *buffer = new_buffer;
+    *capacity = new_capacity;
     return ESP_OK;
 }
 
@@ -68,36 +63,31 @@ static esp_err_t read_hmac_block_stream(FILE *f, uint8_t **out_data, size_t *out
         }
 
         uint32_t block_size = kdbx_read_le32(size_buf);
+#if KDBX_VERBOSE_LOG
         ESP_LOGI(TAG, "KDBX HMAC block %lu size=%lu",
                  (unsigned long)block_index,
                  (unsigned long)block_size);
+#endif
 
         if (block_size == 0) {
             break;
         }
         data_block_count++;
 
-        uint8_t *block = malloc(block_size);
-        if (!block) {
+        esp_err_t ret = reserve_bytes(&buffer, &capacity, len + block_size);
+        if (ret != ESP_OK) {
             free(buffer);
-            return ESP_ERR_NO_MEM;
+            kdbx_log_elapsed("read HMAC block stream failed reserve", start_us);
+            return ret;
         }
 
-        if (fread(block, 1, block_size, f) != block_size) {
+        if (fread(buffer + len, 1, block_size, f) != block_size) {
             ESP_LOGW(TAG, "Unexpected EOF while reading HMAC block data %lu", (unsigned long)block_index);
-            free(block);
             free(buffer);
             kdbx_log_elapsed("read HMAC block stream failed EOF in block data", start_us);
             return ESP_ERR_INVALID_SIZE;
         }
-
-        esp_err_t ret = append_bytes(&buffer, &len, &capacity, block, block_size);
-        free(block);
-        if (ret != ESP_OK) {
-            free(buffer);
-            kdbx_log_elapsed("read HMAC block stream failed append", start_us);
-            return ret;
-        }
+        len += block_size;
 
         kdbx_crypto_cooperate();
     }
@@ -391,6 +381,35 @@ static esp_err_t inflate_gzip_payload(const uint8_t *gzip,
         return ret;
     }
 
+    uint32_t expected_len = kdbx_read_le32(gzip + gzip_len - 4);
+    if (expected_len > 0 && expected_len <= 262144) {
+        uint8_t *xml = malloc((size_t)expected_len + 1);
+        if (!xml) {
+            kdbx_log_elapsed("inflate gzip payload failed no memory", start_us);
+            return ESP_ERR_NO_MEM;
+        }
+
+        size_t written = tinfl_decompress_mem_to_mem(xml,
+                                                     expected_len,
+                                                     deflate,
+                                                     deflate_len,
+                                                     TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+        if (written != TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) {
+            xml[written] = '\0';
+            *out_xml = xml;
+            *out_xml_len = written;
+            ESP_LOGI(TAG, "KDBX timing: gzip compressed=%u deflate=%u inflated=%u expected=%u",
+                     (unsigned int)gzip_len,
+                     (unsigned int)deflate_len,
+                     (unsigned int)written,
+                     (unsigned int)expected_len);
+            kdbx_log_elapsed("inflate gzip payload", start_us);
+            return ESP_OK;
+        }
+
+        free(xml);
+    }
+
     for (size_t capacity = 8192; capacity <= 262144; capacity *= 2) {
         uint8_t *xml = malloc(capacity + 1);
         if (!xml) {
@@ -423,6 +442,7 @@ static esp_err_t inflate_gzip_payload(const uint8_t *gzip,
     return ESP_ERR_INVALID_SIZE;
 }
 
+#if KDBX_VERBOSE_LOG
 static size_t count_substrings(const char *text, const char *needle)
 {
     size_t count = 0;
@@ -467,9 +487,11 @@ static size_t count_utf16le_entry_tags(const uint8_t *xml, size_t xml_len)
 
     return count;
 }
+#endif
 
 static void log_xml_summary(const uint8_t *xml, size_t xml_len)
 {
+#if KDBX_VERBOSE_LOG
     kdbx_log_hex_value("KDBX XML first bytes", xml, xml_len);
 
     if (looks_like_utf16le_xml(xml, xml_len)) {
@@ -506,6 +528,10 @@ static void log_xml_summary(const uint8_t *xml, size_t xml_len)
              (unsigned int)count_substrings((const char *)xml, "<Entry>"),
              preview,
              xml_len > preview_len ? "..." : "");
+#else
+    (void)xml;
+    (void)xml_len;
+#endif
 }
 
 static bool copy_between(const char *start,
@@ -611,6 +637,9 @@ static void parse_entry_string_fields(const char *entry_start,
                                       kdbx_protected_stream_t *protected_stream,
                                       kdbx_entry_sink_t *sink)
 {
+#if !KDBX_VERBOSE_LOG
+    (void)entry_index;
+#endif
     char title[96] = "";
     char username[96] = "";
     char url[128] = "";
@@ -658,6 +687,7 @@ static void parse_entry_string_fields(const char *entry_start,
         cursor = string_end + strlen("</String>");
     }
 
+#if KDBX_VERBOSE_LOG
     ESP_LOGI(TAG,
              "KDBX entry %u title='%s' username='%s' url='%s' password_%s_len=%u",
              entry_index,
@@ -666,10 +696,12 @@ static void parse_entry_string_fields(const char *entry_start,
              url,
              password_protected ? "protected" : "plain",
              (unsigned int)strlen(password));
+#endif
 
     if (*sink->entry_count < sink->max_entries) {
         kdbx_entry_t *entry = &sink->entries[(*sink->entry_count)++];
-        strlcpy(entry->title, title[0] ? title : "(no title)", sizeof(entry->title));
+        const char *entry_title = title[0] ? title : (username[0] ? username : "(no title)");
+        strlcpy(entry->title, entry_title, sizeof(entry->title));
         strlcpy(entry->username, username, sizeof(entry->username));
         strlcpy(entry->url, url, sizeof(entry->url));
         strlcpy(entry->password, password, sizeof(entry->password));
@@ -721,6 +753,9 @@ static void parse_kdbx_entries(const uint8_t *xml,
         entry_index++;
         parse_entry_string_fields(cursor, entry_end, entry_index, &protected_stream, &sink);
         cursor = entry_end + strlen("</Entry>");
+        if (*entry_count >= max_entries) {
+            break;
+        }
         if ((entry_index & 0x03) == 0) {
             kdbx_crypto_cooperate();
         }

@@ -1,5 +1,5 @@
 authenticatorGetAssertion 是 FIDO2 注册之后的登录阶段。
-你的 MakeCredential 测试通过，只说明：
+              你的 MakeCredential 测试通过，只说明：
 
 ECC 密钥生成 OK
 Credential 保存 OK

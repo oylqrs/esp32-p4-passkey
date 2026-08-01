@@ -4,6 +4,8 @@
 #include "canokey_esp32p4.h"
 #include "device.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "lvgl.h"
 
 #define FIDO_CONFIRM_WIDTH  392
@@ -13,6 +15,12 @@ static const char *TAG = "ui_fido";
 static lv_obj_t *s_dialog;
 static bool s_dialog_pending;
 static uint8_t s_dialog_cbor_cmd;
+static QueueHandle_t s_fido_ui_queue;
+static lv_timer_t *s_fido_ui_timer;
+
+typedef enum {
+    FIDO_UI_CMD_SHOW_CONFIRM,
+} fido_ui_cmd_t;
 
 static const char *fido_confirm_title(uint8_t cbor_cmd)
 {
@@ -90,10 +98,8 @@ static lv_obj_t *add_button(lv_obj_t *parent, const char *text, lv_align_t align
     return button;
 }
 
-static void show_fido_confirm_async(void *user_data)
+static void show_fido_confirm_ui(void)
 {
-    (void)user_data;
-
     if (s_dialog) {
         ESP_LOGW(TAG, "skip FIDO confirm dialog: already visible");
         return;
@@ -141,6 +147,37 @@ static void show_fido_confirm_async(void *user_data)
     ESP_LOGI(TAG, "FIDO confirm dialog ready");
 }
 
+static void fido_ui_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (!s_fido_ui_queue) {
+        return;
+    }
+
+    fido_ui_cmd_t cmd;
+    while (xQueueReceive(s_fido_ui_queue, &cmd, 0) == pdTRUE) {
+        if (cmd == FIDO_UI_CMD_SHOW_CONFIRM) {
+            show_fido_confirm_ui();
+        }
+    }
+}
+
+static bool post_fido_ui_cmd(fido_ui_cmd_t cmd)
+{
+    if (!s_fido_ui_queue) {
+        ESP_LOGW(TAG, "FIDO UI queue is not ready");
+        return false;
+    }
+
+    if (xQueueSend(s_fido_ui_queue, &cmd, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "FIDO UI queue full");
+        return false;
+    }
+
+    return true;
+}
+
 static void ui_fido_confirm_request(uint8_t entry)
 {
     ESP_LOGW(TAG, "user presence request entry=%u dialog=%u pending=%u",
@@ -163,11 +200,29 @@ static void ui_fido_confirm_request(uint8_t entry)
     ESP_LOGI(TAG, "schedule FIDO confirm dialog cmd=0x%02x title=%s",
              s_dialog_cbor_cmd,
              fido_confirm_title(s_dialog_cbor_cmd));
-    lv_async_call(show_fido_confirm_async, NULL);
+    if (!post_fido_ui_cmd(FIDO_UI_CMD_SHOW_CONFIRM)) {
+        s_dialog_pending = false;
+    }
 }
 
 void ui_fido_confirm_init(void)
 {
+    if (!s_fido_ui_queue) {
+        s_fido_ui_queue = xQueueCreate(4, sizeof(fido_ui_cmd_t));
+        if (!s_fido_ui_queue) {
+            ESP_LOGW(TAG, "Failed to create FIDO UI queue");
+            return;
+        }
+    }
+
+    if (!s_fido_ui_timer) {
+        s_fido_ui_timer = lv_timer_create(fido_ui_timer_cb, 20, NULL);
+        if (!s_fido_ui_timer) {
+            ESP_LOGW(TAG, "Failed to create FIDO UI timer");
+            return;
+        }
+    }
+
     canokey_esp32p4_set_user_presence_request_callback(ui_fido_confirm_request);
     ESP_LOGI(TAG, "FIDO confirm callback registered");
 }

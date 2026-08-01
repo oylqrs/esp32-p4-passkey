@@ -2,12 +2,35 @@
 
 #include <stdint.h>
 
+#include "esp_log.h"
+#include "esp_system.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "FIDO_Management.h"
+#include "Serach_UI.h"
+#include "setup_ui.h"
+#include "smartcard_ui.h"
 #include "ui_password_manager.h"
+#include "ui_new_entry.h"
+#include "ui_script_detail.h"
 #include "lvgl.h"
 #include "ui_nav.h"
+#include "usb_hid_keyboard.h"
 
 #define UI_SCREEN2_WIDTH  480
+#define LCD_BACKLIGHT_GPIO GPIO_NUM_19
+
+static const char *TAG = "ui_screen2";
+
+static void powerdown_reset(void)
+{
+    ESP_LOGW(TAG, "Powerdown selected: turn off backlight before restart");
+    gpio_set_direction(LCD_BACKLIGHT_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LCD_BACKLIGHT_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    esp_restart();
+}
 
 typedef struct {
     const char *symbol;
@@ -49,8 +72,20 @@ static void menu_item_event_cb(lv_event_t *event)
     uintptr_t index = (uintptr_t)lv_event_get_user_data(event);
     if (index == 0) {
         ui_nav_push(ui_screen2_show, ui_password_manager_show);
+    } else if (index == 1) {
+        ui_nav_push(ui_screen2_show, serach_ui_show);
+    } else if (index == 2) {
+        ui_nav_push(ui_screen2_show, ui_new_entry_show);
     } else if (index == 3) {
         ui_nav_push(ui_screen2_show, FIDO_Management_show);
+    } else if (index == 4) {
+        ui_nav_push(ui_screen2_show, smartcard_ui_show);
+    } else if (index == 6) {
+        ui_nav_push(ui_screen2_show, ui_script_detail_show);
+    } else if (index == 7) {
+        ui_nav_push(ui_screen2_show, setup_ui_show);
+    } else if (index == 8) {
+        powerdown_reset();
     }
 }
 
@@ -94,6 +129,13 @@ static void add_menu_item(lv_obj_t *parent, const menu_item_t *item, size_t inde
 
 void ui_screen2_show(void)
 {
+    ui_nav_set_root(ui_screen2_show);
+
+    esp_err_t ret = usb_hid_disable_smartcard_reader();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SmartCard reader disable failed: %s", esp_err_to_name(ret));
+    }
+
     lv_obj_t *screen = lv_screen_active();
     lv_obj_clean(screen);
     ui_nav_enable_right_swipe(screen);

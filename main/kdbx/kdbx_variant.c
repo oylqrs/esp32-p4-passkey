@@ -46,6 +46,7 @@ void kdbx_crypto_cooperate(void)
 
 void kdbx_log_hex_value(const char *label, const uint8_t *data, size_t len)
 {
+#if KDBX_VERBOSE_LOG
     char hex[65];
     size_t bytes = len < 16 ? len : 16;
     for (size_t i = 0; i < bytes; i++) {
@@ -58,6 +59,11 @@ void kdbx_log_hex_value(const char *label, const uint8_t *data, size_t len)
              (unsigned int)len,
              hex,
              len > bytes ? "..." : "");
+#else
+    (void)label;
+    (void)data;
+    (void)len;
+#endif
 }
 
 int64_t kdbx_now_us(void)
@@ -233,8 +239,10 @@ void kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *h
         } else if (strcmp(key, "R") == 0 && (value_type == 0x05 || value_type == 0x0d) && value_len == 8) {
             header->kdf_rounds = kdbx_read_le64(value);
             header->has_kdf_rounds = true;
+            ESP_LOGI(TAG, "KDBX AES-KDF rounds=%llu", (unsigned long long)header->kdf_rounds);
         }
 
+#if KDBX_VERBOSE_LOG
         if ((value_type == 0x04 || value_type == 0x0c) && value_len == 4) {
             ESP_LOGI(TAG, "KDF %s type=0x%02x value=%lu",
                      key,
@@ -262,6 +270,7 @@ void kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *h
             snprintf(label, sizeof(label), "KDF %s type=0x%02x", key, value_type);
             kdbx_log_hex_value(label, value, value_len);
         }
+#endif
 
         offset += value_len;
     }

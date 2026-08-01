@@ -8,6 +8,7 @@
 #include <stddef.h>
 
 #include "credential_test.h"
+#include "ADC/battery_monitor.h"
 #include "FT6336.h"
 #include "canokey_esp32p4.h"
 #include "lcd/lcd_driver.h"
@@ -22,13 +23,19 @@
 #include "test_random.h"
 #include "test_sha256.h"
 #include "ui/UI_SCREEN1.h"
+#include "ui/ui_clock_desktop.h"
 #include "ui/ui_fido_confirm.h"
+#include "ui/ui_password_manager.h"
 #include "usb_hid_keyboard.h"
+#include "usb_msc.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
@@ -37,6 +44,9 @@ static const char *TAG = "app";
 
 #define LVGL_TICK_PERIOD_MS             2
 #define LVGL_DRAW_BUF_LINES             40
+#define BOOT_NVS_NAMESPACE              "boot_mode"
+#define BOOT_NVS_KEY                    "reset_count"
+#define LCD_BACKLIGHT_GPIO              GPIO_NUM_19
 
 typedef struct {
     esp_lcd_panel_handle_t panel;
@@ -163,33 +173,131 @@ static void lvgl_port_start(esp_lcd_panel_handle_t panel, bool touch_enabled)
     ESP_ERROR_CHECK(esp_timer_create(&tick_timer_args, &tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer, LVGL_TICK_PERIOD_MS * 1000));
 
-    ui_screen1_show();
+    ui_clock_desktop_show();
+    ui_fido_confirm_init();
     xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 4, NULL);
 }
 
-void app_main(void)
+static void gpio1_init_high(void)
 {
-    
+    const gpio_config_t gpio1_config = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_37,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&gpio1_config));
+    ESP_ERROR_CHECK(gpio_set_level(GPIO_NUM_37, 1));
+
+ 
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    gpio_set_level(GPIO_NUM_37, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(GPIO_NUM_37, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+}
+
+static esp_err_t init_nvs_storage(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    return ret;
+}
+
+static bool should_run_normal_boot(void)
+{
+    esp_err_t ret = init_nvs_storage();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS init failed, falling back to normal boot: %s", esp_err_to_name(ret));
+        return true;
+    }
+
+    nvs_handle_t nvs;
+    ret = nvs_open(BOOT_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS open failed, falling back to normal boot: %s", esp_err_to_name(ret));
+        return true;
+    }
+
+    uint32_t reset_count = 0;
+    ret = nvs_get_u32(nvs, BOOT_NVS_KEY, &reset_count);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        reset_count = 1;
+    } else if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS read reset_count failed, falling back to normal boot: %s", esp_err_to_name(ret));
+        nvs_close(nvs);
+        return true;
+    } else {
+        reset_count++;
+    }
+
+    ESP_ERROR_CHECK(nvs_set_u32(nvs, BOOT_NVS_KEY, reset_count));
+    ESP_ERROR_CHECK(nvs_commit(nvs));
+    nvs_close(nvs);
+
+    ESP_LOGI(TAG, "Boot toggle count=%lu mode=%s",
+             (unsigned long)reset_count,
+             (reset_count & 1) ? "blackout" : "normal");
+    return (reset_count & 1) == 0;
+}
+
+static void force_black_screen(void)
+{
+    const gpio_config_t backlight_config = {
+        .pin_bit_mask = 1ULL << LCD_BACKLIGHT_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&backlight_config));
+    ESP_ERROR_CHECK(gpio_set_level(LCD_BACKLIGHT_GPIO, 0));
+    ESP_LOGW(TAG, "Blackout boot: LCD backlight forced off");
+}
+
+void app_main(void)
+{ 
+    gpio1_init_high();
+
+    if (!should_run_normal_boot()) {
+        force_black_screen();
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
     canokey_esp32p4_crypto_init();
      esp_err_t hid_ret = usb_hid_keyboard_init();
     if (hid_ret != ESP_OK) {
         ESP_LOGW(TAG, "USB HID init failed: %s", esp_err_to_name(hid_ret));
     } 
+
+    esp_err_t canokey_ret = canokey_esp32p4_start();
+    if (canokey_ret != ESP_OK) {
+        ESP_LOGW(TAG, "CanoKey/FIDO task start failed: %s", esp_err_to_name(canokey_ret));
+    }
+
+    esp_err_t battery_ret = battery_monitor_start();
+    if (battery_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Battery monitor start failed: %s", esp_err_to_name(battery_ret));
+    }
     
     esp_err_t msc_ret = usb_msc_storage_init();
     if (msc_ret != ESP_OK) {
         ESP_LOGW(TAG, "USB MSC storage init failed: %s", esp_err_to_name(msc_ret));
-    }
-
-
-    else if (msc_ret == ESP_OK) {
-        esp_err_t usbstore_ret = usb_hid_mount_usbstore_app();
+    } else {
+        esp_err_t usbstore_ret = usb_hid_disable_usbstore();
         if (usbstore_ret != ESP_OK) {
-            ESP_LOGW(TAG, "USB disk default APP mount failed: %s", esp_err_to_name(usbstore_ret));
+            ESP_LOGW(TAG, "USB store default-off setup failed: %s", esp_err_to_name(usbstore_ret));
         }
     }
-
-
 
    // test_sha256();
     //test_hmac_sha256();
@@ -214,15 +322,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Start LVGL");
     lvgl_port_start(dpi_panel, touch_enabled);
-
-    ui_fido_confirm_init();
-    
-    //
-    //暂时关闭fido2
-    //esp_err_t canokey_ret = canokey_esp32p4_start();
-   /* if (canokey_ret != ESP_OK) {
-        ESP_LOGW(TAG, "CanoKey init failed: %s", esp_err_to_name(canokey_ret));
-    }*/
+    ui_password_manager_start_background_load();
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));

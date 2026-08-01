@@ -7,8 +7,30 @@
 static const char *TAG = "canokey_fs";
 
 int __real_write_file(const char *path, const void *buf, lfs_soff_t off, lfs_size_t len, uint8_t trunc);
+int __real_read_file(const char *path, void *buf, lfs_soff_t off, lfs_size_t len);
 int __real_write_attr(const char *path, uint8_t attr, const void *buf, lfs_size_t len);
 int __real_read_attr(const char *path, uint8_t attr, void *buf, lfs_size_t len);
+int __real_remove_attr(const char *path, uint8_t attr);
+int __real_get_file_size(const char *path);
+int __real_remove_file(const char *path);
+
+bool canokey_gpg_flash_is_path(const char *path);
+int canokey_gpg_flash_write_file(const char *path, const void *buf, lfs_soff_t off, lfs_size_t len, uint8_t trunc);
+int canokey_gpg_flash_read_file(const char *path, void *buf, lfs_soff_t off, lfs_size_t len);
+int canokey_gpg_flash_write_attr(const char *path, uint8_t attr, const void *buf, lfs_size_t len);
+int canokey_gpg_flash_read_attr(const char *path, uint8_t attr, void *buf, lfs_size_t len);
+int canokey_gpg_flash_remove_attr(const char *path, uint8_t attr);
+int canokey_gpg_flash_get_file_size(const char *path);
+int canokey_gpg_flash_remove_file(const char *path);
+
+bool canokey_piv_storage_is_path(const char *path);
+int canokey_piv_storage_read_file(const char *path, void *buf, lfs_soff_t off, lfs_size_t len);
+int canokey_piv_storage_write_file(const char *path, const void *buf, lfs_soff_t off, lfs_size_t len, uint8_t trunc);
+int canokey_piv_storage_read_attr(const char *path, uint8_t attr, void *buf, lfs_size_t len);
+int canokey_piv_storage_write_attr(const char *path, uint8_t attr, const void *buf, lfs_size_t len);
+int canokey_piv_storage_remove_attr(const char *path, uint8_t attr);
+int canokey_piv_storage_get_file_size(const char *path);
+int canokey_piv_storage_remove_file(const char *path);
 
 static bool is_ctap_resident_file(const char *path)
 {
@@ -42,6 +64,13 @@ static bool is_ctap_key_file(const char *path)
 
 int __wrap_write_file(const char *path, const void *buf, lfs_soff_t off, lfs_size_t len, uint8_t trunc)
 {
+    if (canokey_gpg_flash_is_path(path)) {
+        return canokey_gpg_flash_write_file(path, buf, off, len, trunc);
+    }
+    if (canokey_piv_storage_is_path(path)) {
+        return canokey_piv_storage_write_file(path, buf, off, len, trunc);
+    }
+
     if (is_ctap_resident_file(path) || is_ctap_key_file(path)) {
         ESP_LOGW(TAG,
                  "CTAP flash write path=%s off=%ld len=%lu trunc=%u",
@@ -65,8 +94,27 @@ int __wrap_write_file(const char *path, const void *buf, lfs_soff_t off, lfs_siz
     return ret;
 }
 
+int __wrap_read_file(const char *path, void *buf, lfs_soff_t off, lfs_size_t len)
+{
+    if (canokey_gpg_flash_is_path(path)) {
+        return canokey_gpg_flash_read_file(path, buf, off, len);
+    }
+    if (canokey_piv_storage_is_path(path)) {
+        return canokey_piv_storage_read_file(path, buf, off, len);
+    }
+
+    return __real_read_file(path, buf, off, len);
+}
+
 int __wrap_write_attr(const char *path, uint8_t attr, const void *buf, lfs_size_t len)
 {
+    if (canokey_gpg_flash_is_path(path)) {
+        return canokey_gpg_flash_write_attr(path, attr, buf, len);
+    }
+    if (canokey_piv_storage_is_path(path)) {
+        return canokey_piv_storage_write_attr(path, attr, buf, len);
+    }
+
     if ((path && strcmp(path, "ctap_dc") == 0) || is_ctap_key_file(path)) {
         ESP_LOGW(TAG,
                  "CTAP flash attr write path=%s attr=0x%02x(%s) len=%lu",
@@ -92,6 +140,13 @@ int __wrap_write_attr(const char *path, uint8_t attr, const void *buf, lfs_size_
 
 int __wrap_read_attr(const char *path, uint8_t attr, void *buf, lfs_size_t len)
 {
+    if (canokey_gpg_flash_is_path(path)) {
+        return canokey_gpg_flash_read_attr(path, attr, buf, len);
+    }
+    if (canokey_piv_storage_is_path(path)) {
+        return canokey_piv_storage_read_attr(path, attr, buf, len);
+    }
+
     int ret = __real_read_attr(path, attr, buf, len);
     if ((path && strcmp(path, "ctap_dc") == 0) || is_ctap_key_file(path)) {
         ESP_LOGW(TAG,
@@ -111,4 +166,40 @@ int __wrap_read_attr(const char *path, uint8_t attr, void *buf, lfs_size_t len)
         }
     }
     return ret;
+}
+
+int __wrap_remove_attr(const char *path, uint8_t attr)
+{
+    if (canokey_gpg_flash_is_path(path)) {
+        return canokey_gpg_flash_remove_attr(path, attr);
+    }
+    if (canokey_piv_storage_is_path(path)) {
+        return canokey_piv_storage_remove_attr(path, attr);
+    }
+
+    return __real_remove_attr(path, attr);
+}
+
+int __wrap_get_file_size(const char *path)
+{
+    if (canokey_gpg_flash_is_path(path)) {
+        return canokey_gpg_flash_get_file_size(path);
+    }
+    if (canokey_piv_storage_is_path(path)) {
+        return canokey_piv_storage_get_file_size(path);
+    }
+
+    return __real_get_file_size(path);
+}
+
+int __wrap_remove_file(const char *path)
+{
+    if (canokey_gpg_flash_is_path(path)) {
+        return canokey_gpg_flash_remove_file(path);
+    }
+    if (canokey_piv_storage_is_path(path)) {
+        return canokey_piv_storage_remove_file(path);
+    }
+
+    return __real_remove_file(path);
 }

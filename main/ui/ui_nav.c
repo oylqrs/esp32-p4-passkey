@@ -4,6 +4,7 @@
 
 static ui_screen_show_cb_t s_back_stack[UI_NAV_STACK_DEPTH];
 static uint8_t s_back_stack_len;
+static ui_screen_show_cb_t s_root_screen;
 
 static void right_swipe_event_cb(lv_event_t *event)
 {
@@ -29,6 +30,25 @@ void ui_nav_push(ui_screen_show_cb_t current_screen, ui_screen_show_cb_t next_sc
     next_screen();
 }
 
+void ui_nav_clear(void)
+{
+    s_back_stack_len = 0;
+}
+
+void ui_nav_replace(ui_screen_show_cb_t next_screen)
+{
+    ui_nav_clear();
+    if (next_screen) {
+        next_screen();
+    }
+}
+
+void ui_nav_set_root(ui_screen_show_cb_t root_screen)
+{
+    s_root_screen = root_screen;
+    ui_nav_clear();
+}
+
 void ui_nav_go_back(void)
 {
     if (s_back_stack_len == 0) {
@@ -36,13 +56,16 @@ void ui_nav_go_back(void)
     }
 
     ui_screen_show_cb_t previous_screen = s_back_stack[--s_back_stack_len];
+    if (previous_screen == s_root_screen) {
+        ui_nav_clear();
+    }
     if (previous_screen) {
         previous_screen();
     }
 }
 
 void ui_nav_enable_right_swipe(lv_obj_t *screen)
-    {
+{
     if (!screen) {
         return;
     }

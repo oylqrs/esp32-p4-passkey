@@ -83,10 +83,16 @@ list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_crypto.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_ecc_debug.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_flash.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_fs_debug.c")
+list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_gpg_flash.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_random.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_time.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_ui.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_usb.c")
+list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/../piv/piv_crypto.c")
+list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/../piv/piv_dispatch.c")
+list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/../piv/piv_pin.c")
+list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/../piv/piv_port.c")
+list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/../piv/piv_storage.c")
 
 set(CANOKEY_INCLUDE_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/include"
@@ -145,10 +151,35 @@ target_compile_options(${COMPONENT_LIB}
 
 target_link_options(${COMPONENT_LIB}
     INTERFACE
-        "-Wl,--wrap=ecc_sign"
-        "-Wl,--wrap=K__ed25519_sign"
-        "-Wl,--wrap=sign_with_private_key"
         "-Wl,--wrap=write_file"
+        "-Wl,--wrap=read_file"
         "-Wl,--wrap=write_attr"
         "-Wl,--wrap=read_attr"
+        "-Wl,--wrap=remove_attr"
+        "-Wl,--wrap=get_file_size"
+        "-Wl,--wrap=remove_file"
+        "-Wl,--wrap=admin_platform_serial_read"
+        "-Wl,--wrap=pin_create"
+        "-Wl,--wrap=pin_verify"
+        "-Wl,--wrap=pin_update"
+        "-Wl,--wrap=pin_get_size"
+        "-Wl,--wrap=pin_get_retries"
+        "-Wl,--wrap=pin_get_default_retries"
+        "-Wl,--wrap=pin_set_retries"
+        "-Wl,--wrap=pin_clear"
+        "-Wl,--wrap=piv_process_apdu"
+        "-Wl,--wrap=piv_process_apdu_message"
+        "-Wl,--wrap=rsa_generate_key"
+        "-Wl,--wrap=rsa_get_public_key"
+        "-Wl,--wrap=rsa_private"
+        "-Wl,--wrap=rsa_sign_pkcs_v15"
+        "-Wl,--wrap=tdes_enc"
+        "-Wl,--wrap=tdes_dec"
+        "-Wl,--wrap=ecdh"
+        "-Wl,--wrap=ck_generate_key"
+        "-Wl,--wrap=ck_sign"
+        "-Wl,--wrap=piv_install"
+        "-Wl,--wrap=piv_poweroff"
+        "-Wl,--wrap=piv_platform_algorithm_extension_config_read"
+        "-Wl,--wrap=piv_platform_algorithm_extension_config_write"
 )

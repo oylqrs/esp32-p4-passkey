@@ -1,0 +1,10 @@
+# ESP-IDF编译产物
+build/
+*.elf
+*.bin
+*.map
+sdkconfig.old
+sdkconfig.defaults
+.vscode/
+cmake-build-*
+*.log

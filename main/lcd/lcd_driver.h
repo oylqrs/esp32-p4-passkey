@@ -10,3 +10,4 @@
 
 esp_lcd_panel_handle_t lcd_driver_init(void);
 void lcd_driver_set_backlight(uint8_t percent);
+ 

@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "lvgl.h"
+#include "setup_ui.h"
 #include "ui_nav.h"
 
 #define UI_SCREEN1_WIDTH  480
@@ -37,8 +38,8 @@ static void pin_keypad_event_cb(lv_event_t *event)
     } else if (strcmp(key, LV_SYMBOL_OK) == 0) {
         const char *pin = lv_textarea_get_text(s_pin_textarea);
         ESP_LOGI("PIN_PAGE", "PIN input: %s", pin);
-        if (strcmp(pin, "1234") == 0) {
-            ui_nav_push(ui_screen1_show, ui_screen2_show);
+        if (setup_ui_device_password_matches(pin)) {
+            ui_nav_replace(ui_screen2_show);
         } else {
             ESP_LOGW("PIN_PAGE", "Wrong PIN");
             lv_textarea_set_text(s_pin_textarea, "");
@@ -54,7 +55,6 @@ void ui_screen1_show(void)
 {
     lv_obj_t *screen = lv_screen_active();
     lv_obj_clean(screen);
-    ui_nav_enable_right_swipe(screen);
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x11141A), 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
 

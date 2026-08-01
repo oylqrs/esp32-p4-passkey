@@ -123,3 +123,35 @@ compare:
 PASS
 
 ⸻
+
+第三步：多个 Credential 测试
+FIDO设备必须支持多个网站。
+
+模拟：
+Google
+GitHub
+Microsoft
+
+保存：
+storage_add()
+
+三次。
+
+Flash：
+credential.db
+[
+ credential1
+ credential2
+ credential3
+]
+
+然后：
+
+查询：
+storage_find_by_rp()
+
+输入：
+github.com
+
+返回：
+credential2

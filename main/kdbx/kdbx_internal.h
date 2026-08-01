@@ -10,6 +10,7 @@
 #include "mbedtls/md.h"
 
 #define KDBX_MAX_ENTRIES 24
+#define KDBX_VERBOSE_LOG 0
 
 typedef struct {
     uint8_t cipher_id[16];

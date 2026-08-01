@@ -10,6 +10,7 @@
 
 #include "esp_log.h"
 #include "kdbx_internal.h"
+#include "ui/ui_password_manager.h"
 
 #define KDBX_DATA_DIR       "/data"
 #define KDBX_PATH_MAX       256
@@ -83,12 +84,14 @@ static esp_err_t scan_kdbx_dir(const char *dir_path, int depth, char *out_path, 
             continue;
         }
 
+#if KDBX_VERBOSE_LOG
         ESP_LOGI(TAG, "%*s%s %s size=%ld",
                  depth * 2,
                  "",
                  S_ISDIR(st.st_mode) ? "[DIR]" : "[FILE]",
                  child_path,
                  (long)st.st_size);
+#endif
 
         if (!S_ISDIR(st.st_mode) && looks_like_kdbx_name(entry->d_name)) {
             strlcpy(out_path, child_path, out_path_len);
@@ -126,7 +129,10 @@ static esp_err_t find_password_file(char *out_path, size_t out_path_len)
     esp_err_t ret = ESP_ERR_NOT_FOUND;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (!ascii_equal_ci(entry->d_name, "123.txt")) {
+        bool is_password_config = ascii_equal_ci(entry->d_name, "config.txt") ||
+                                  ascii_equal_ci(entry->d_name, "main_config") ||
+                                  ascii_equal_ci(entry->d_name, "main_config.txt");
+        if (!is_password_config) {
             continue;
         }
 
@@ -167,19 +173,51 @@ static void trim_ascii(char *text)
 
 static void parse_password_text(char *password)
 {
-    char *first_quote = strchr(password, '"');
-    if (first_quote) {
-        char *second_quote = strchr(first_quote + 1, '"');
-        if (second_quote) {
-            *second_quote = '\0';
-            memmove(password, first_quote + 1, strlen(first_quote + 1) + 1);
-            return;
+    static const char key[] = "kdbx_password";
+    char *value = NULL;
+    char *cursor = password;
+
+    while (*cursor) {
+        char *line_end = strpbrk(cursor, "\r\n");
+        if (line_end) {
+            *line_end = '\0';
+        }
+
+        trim_ascii(cursor);
+        if (strncmp(cursor, key, sizeof(key) - 1) == 0) {
+            char *after_key = cursor + sizeof(key) - 1;
+            while (*after_key == ' ' || *after_key == '\t') {
+                after_key++;
+            }
+
+            if (*after_key == '=') {
+                value = after_key + 1;
+                break;
+            }
+        }
+
+        if (!line_end) {
+            break;
+        }
+        cursor = line_end + 1;
+        while (*cursor == '\r' || *cursor == '\n') {
+            cursor++;
         }
     }
 
-    char *equals = strchr(password, '=');
-    if (equals) {
-        memmove(password, equals + 1, strlen(equals + 1) + 1);
+    if (value) {
+        trim_ascii(value);
+        char *first_quote = strchr(value, '"');
+        if (first_quote) {
+            char *second_quote = strchr(first_quote + 1, '"');
+            if (second_quote) {
+                *second_quote = '\0';
+                memmove(password, first_quote + 1, strlen(first_quote + 1) + 1);
+                return;
+            }
+        }
+
+        memmove(password, value, strlen(value) + 1);
     }
 
     trim_ascii(password);
@@ -191,7 +229,7 @@ static esp_err_t read_password(char *password, size_t password_len)
     char password_path[KDBX_PATH_MAX];
     esp_err_t ret = find_password_file(password_path, sizeof(password_path));
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Password file 123.txt not found in %s", KDBX_DATA_DIR);
+        ESP_LOGW(TAG, "Password config file config.txt not found in %s", KDBX_DATA_DIR);
         kdbx_log_elapsed("read password failed before open", start_us);
         return ret;
     }
