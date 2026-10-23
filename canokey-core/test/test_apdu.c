@@ -917,13 +917,14 @@ static void test_ctap_hid_get_info_stream_source(void **state) {
   CTAPHID_TxSource source = {0};
   size_t written = 0;
   const uint8_t canonical_options[] = {
-      0x04, 0xA9, 0x62, 'r',  'k', 0xF5, 0x68, 'a',  'l', 'w',  'a',  'y', 's', 'U', 'v', 0xF4, 0x68, 'c',  'r',
-      'e',  'd',  'M',  'g',  'm', 't',  0xF5, 0x69, 'a', 'u',  't',  'h', 'n', 'r', 'C', 'f',  'g',  0xF5, 0x69,
-      'c',  'l',  'i',  'e',  'n', 't',  'P',  'i',  'n', 0xF4, 0x6A, 'l', 'a', 'r', 'g', 'e',  'B',  'l',  'o',
-      'b',  's',  0xF5, 0x6E, 'p', 'i',  'n',  'U',  'v', 'A',  'u',  't', 'h', 'T', 'o', 'k',  'e',  'n',  0xF5,
-      0x6F, 's',  'e',  't',  'M', 'i',  'n',  'P',  'I', 'N',  'L',  'e', 'n', 'g', 't', 'h',  0xF5, 0x70, 'm',
-      'a',  'k',  'e',  'C',  'r', 'e',  'd',  'U',  'v', 'N',  'o',  't', 'R', 'q', 'd', 0xF5,
+      0x04, 0xA7, 0x62, 'r',  'k',  0xF5, 0x62, 'u',  'p',  0xF5, 0x68, 'c',  'r',  'e',  'd',  'M',  'g',
+      'm',  't',  0xF5, 0x69, 'c',  'l',  'i',  'e',  'n',  't',  'P',  'i',  'n',  0xF4, 0x6A, 'l',  'a',
+      'r',  'g',  'e',  'B',  'l',  'o',  'b',  's',  0xF5, 0x6E, 'p',  'i',  'n',  'U',  'v',  'A',  'u',
+      't',  'h',  'T',  'o',  'k',  'e',  'n',  0xF5, 0x70, 'm',  'a',  'k',  'e',  'C',  'r',  'e',  'd',
+      'U',  'v',  'N',  'o',  't',  'R',  'q',  'd',  0xF5,
   };
+  const uint8_t large_blob_capacity[] = {GI_RESP_MAX_SERIALIZED_LARGE_BLOB_ARRAY, 0x19, 0x10, 0x00};
+  const uint8_t cred_blob_capacity[] = {GI_RESP_MAX_CRED_BLOB_LENGTH, 0x18, MAX_CRED_BLOB_LENGTH};
 
   init_apdu_buffer();
   device_init();
@@ -937,10 +938,69 @@ static void test_ctap_hid_get_info_stream_source(void **state) {
   assert_int_equal(source.read(source.ctx, chunk, source.total_len, &written), 0);
   assert_int_equal(written, source.total_len);
   assert_int_equal(chunk[0], 0x00);
-  assert_non_null(find_bytes(chunk, written, "FIDO_2_3", sizeof("FIDO_2_3") - 1));
-  assert_non_null(find_bytes(chunk, written, "minPinLength", sizeof("minPinLength") - 1));
-  assert_non_null(find_bytes(chunk, written, "thirdPartyPayment", sizeof("thirdPartyPayment") - 1));
+  assert_int_equal(chunk[1], 0xAD);
+  assert_true(source.total_len <= 1 + CTAP_GET_INFO_MAX_CBOR_SIZE);
+  assert_non_null(find_bytes(chunk, written, "FIDO_2_0", sizeof("FIDO_2_0") - 1));
+  assert_non_null(find_bytes(chunk, written, "FIDO_2_1", sizeof("FIDO_2_1") - 1));
+  assert_non_null(find_bytes(chunk, written, "U2F_V2", sizeof("U2F_V2") - 1));
+  assert_non_null(find_bytes(chunk, written, "credBlob", sizeof("credBlob") - 1));
+  assert_non_null(find_bytes(chunk, written, "credProtect", sizeof("credProtect") - 1));
+  assert_non_null(find_bytes(chunk, written, "hmac-secret", sizeof("hmac-secret") - 1));
+  assert_non_null(find_bytes(chunk, written, "largeBlobKey", sizeof("largeBlobKey") - 1));
+  assert_non_null(find_bytes(chunk, written, "nfc", sizeof("nfc") - 1));
+  assert_non_null(find_bytes(chunk, written, "usb", sizeof("usb") - 1));
   assert_non_null(find_bytes(chunk + 1, written - 1, canonical_options, sizeof(canonical_options)));
+  assert_non_null(find_bytes(chunk + 1, written - 1, "pinUvAuthToken", sizeof("pinUvAuthToken") - 1));
+  assert_non_null(find_bytes(chunk + 1, written - 1, large_blob_capacity, sizeof(large_blob_capacity)));
+  assert_non_null(find_bytes(chunk + 1, written - 1, cred_blob_capacity, sizeof(cred_blob_capacity)));
+}
+
+static void test_ctap_nfc_get_info_omits_user_presence_option(void **state) {
+  (void)state;
+
+  static const uint8_t get_info_apdu[] = {
+      0x80, 0x10, 0x80, 0x00, 0x01, CTAP_GET_INFO, 0x00,
+  };
+  uint8_t req[] = {CTAP_GET_INFO};
+  uint8_t scratch[64] = {0};
+  uint8_t usb_response[APPLET_SHARED_BUFFER_LENGTH] = {0};
+  uint8_t nfc_response[APPLET_SHARED_BUFFER_LENGTH] = {0};
+  uint8_t c_buf[64] = {0};
+  CAPDU capdu = {.data = c_buf};
+  RAPDU rapdu = {.data = nfc_response};
+  CTAPHID_TxSource source = {0};
+  size_t usb_written = 0;
+  const uint8_t up_option[] = {0x62, 'u', 'p', 0xF5};
+  const uint8_t nfc_options[] = {
+      0x04, 0xA6, 0x62, 'r',  'k',  0xF5, 0x68, 'c',  'r',  'e',  'd',  'M',  'g',  'm',  't',  0xF5,
+      0x69, 'c',  'l',  'i',  'e',  'n',  't',  'P',  'i',  'n',  0xF4, 0x6A, 'l',  'a',  'r',  'g',  'e',
+      'B',  'l',  'o',  'b',  's',  0xF5, 0x6E, 'p',  'i',  'n',  'U',  'v',  'A',  'u',  't',  'h',  'T',
+      'o',  'k',  'e',  'n',  0xF5, 0x70, 'm',  'a',  'k',  'e',  'C',  'r',  'e',  'd',  'U',  'v',  'N',
+      'o',  't',  'R',  'q',  'd',  0xF5,
+  };
+
+  init_apdu_buffer();
+  device_init();
+  assert_int_equal(applets_install(), 0);
+
+  assert_int_equal(ctap_process_cbor_stream_with_src(req, sizeof(req), scratch, sizeof(scratch), &source, CTAP_SRC_HID),
+                   1);
+  assert_int_equal(read_tx_source_all(&source, usb_response, sizeof(usb_response), &usb_written), 0);
+  assert_int_equal(usb_written, source.total_len);
+  assert_true(usb_written <= 1 + CTAP_GET_INFO_MAX_CBOR_SIZE);
+  assert_non_null(find_bytes(usb_response, usb_written, up_option, sizeof(up_option)));
+  if (source.close) source.close(source.ctx);
+
+  set_nfc_state(1);
+
+  assert_int_equal(build_capdu(&capdu, get_info_apdu, sizeof(get_info_apdu)), 0);
+  process_apdu(&capdu, &rapdu);
+  assert_int_equal(rapdu.sw, SW_NO_ERROR);
+  assert_int_equal(rapdu.len + sizeof(up_option), usb_written);
+  assert_null(find_bytes(rapdu.data, rapdu.len, up_option, sizeof(up_option)));
+  assert_non_null(find_bytes(rapdu.data + 1, rapdu.len - 1, nfc_options, sizeof(nfc_options)));
+
+  set_nfc_state(0);
 }
 
 static void test_ctap_config_empty_request_is_legacy_unhandled(void **state) {
@@ -985,7 +1045,7 @@ static void test_ctap_config_toggle_always_uv_without_pin(void **state) {
   assert_true(source.total_len <= sizeof(chunk));
   assert_int_equal(source.read(source.ctx, chunk, source.total_len, &written), 0);
   assert_int_equal(written, source.total_len);
-  assert_null(find_bytes(chunk, written, "U2F_V2", sizeof("U2F_V2") - 1));
+  assert_non_null(find_bytes(chunk, written, "U2F_V2", sizeof("U2F_V2") - 1));
 
   resp_len = sizeof(resp);
   assert_int_equal(ctap_process_cbor_with_src(config_req, sizeof(config_req), resp, &resp_len, CTAP_SRC_HID), 0);
@@ -1335,7 +1395,8 @@ static void test_ctap_get_info_reports_transport_msg_size(void **state) {
   uint8_t resp[512] = {0};
   CTAPHID_TxSource source = {0};
   size_t written = 0;
-  const uint8_t expected[] = {GI_RESP_MAX_MSG_SIZE, 0x19, HI(CTAP_MAX_MSG_SIZE), LO(CTAP_MAX_MSG_SIZE)};
+  const uint8_t expected[] = {GI_RESP_MAX_MSG_SIZE, 0x19, HI(CTAP_GET_INFO_MAX_MSG_SIZE),
+                              LO(CTAP_GET_INFO_MAX_MSG_SIZE)};
 
   init_apdu_buffer();
   device_init();
@@ -2069,6 +2130,7 @@ int main() {
       cmocka_unit_test(test_ctap_poweroff_keeps_credential_management_state),
       cmocka_unit_test(test_ctap_deselect_clears_credential_management_state),
       cmocka_unit_test(test_ctap_hid_get_info_stream_source),
+      cmocka_unit_test(test_ctap_nfc_get_info_omits_user_presence_option),
       cmocka_unit_test(test_ctap_config_empty_request_is_legacy_unhandled),
       cmocka_unit_test(test_ctap_config_toggle_always_uv_without_pin),
       cmocka_unit_test(test_ctap_hid_make_credential_accepts_p9_pub_key_param_order),

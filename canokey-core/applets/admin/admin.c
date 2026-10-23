@@ -212,6 +212,16 @@ uint8_t device_config_is_piv_nfc_enabled(void) { return admin_get_current_config
 
 uint8_t device_config_is_webauthn_enabled(void) { return admin_get_current_config().webauthn_en; }
 
+int admin_device_config_set_ccid_enabled(const uint8_t openpgp_enabled, const uint8_t piv_enabled) {
+  admin_device_config_t next_config = admin_get_current_config();
+  next_config.openpgp_ccid_en = openpgp_enabled != 0;
+  next_config.piv_ccid_en = piv_enabled != 0;
+  if (admin_platform_device_config_write(&next_config) < 0) return -1;
+  current_config = next_config;
+  current_config_valid = 1;
+  return 0;
+}
+
 void admin_poweroff(void) { pin.is_validated = 0; }
 
 int admin_install(const uint8_t reset) {

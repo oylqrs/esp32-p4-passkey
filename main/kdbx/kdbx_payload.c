@@ -22,15 +22,26 @@ typedef struct {
     size_t max_entries;
 } kdbx_entry_sink_t;
 
+typedef struct {
+    size_t index;
+} kdbx_group_stack_item_t;
+
 static esp_err_t reserve_bytes(uint8_t **buffer, size_t *capacity, size_t needed_len)
 {
+    if (needed_len > KDBX_MAX_ENCRYPTED_PAYLOAD_SIZE) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     if (needed_len <= *capacity) {
         return ESP_OK;
     }
 
     size_t new_capacity = *capacity == 0 ? 1024 : *capacity;
     while (new_capacity < needed_len) {
-        new_capacity *= 2;
+        if (new_capacity > KDBX_MAX_ENCRYPTED_PAYLOAD_SIZE / 2U) {
+            new_capacity = KDBX_MAX_ENCRYPTED_PAYLOAD_SIZE;
+            break;
+        }
+        new_capacity *= 2U;
     }
 
     uint8_t *new_buffer = realloc(*buffer, new_capacity);
@@ -74,6 +85,16 @@ static esp_err_t read_hmac_block_stream(FILE *f, uint8_t **out_data, size_t *out
         }
         data_block_count++;
 
+        if (block_size > KDBX_MAX_HMAC_BLOCK_SIZE ||
+            len > KDBX_MAX_ENCRYPTED_PAYLOAD_SIZE - block_size) {
+            ESP_LOGW(TAG, "KDBX HMAC payload is too large: block=%lu accumulated=%u max=%u",
+                     (unsigned long)block_size,
+                     (unsigned int)len,
+                     (unsigned int)KDBX_MAX_ENCRYPTED_PAYLOAD_SIZE);
+            free(buffer);
+            return ESP_ERR_INVALID_SIZE;
+        }
+
         esp_err_t ret = reserve_bytes(&buffer, &capacity, len + block_size);
         if (ret != ESP_OK) {
             free(buffer);
@@ -94,7 +115,7 @@ static esp_err_t read_hmac_block_stream(FILE *f, uint8_t **out_data, size_t *out
 
     *out_data = buffer;
     *out_len = len;
-    ESP_LOGI(TAG, "KDBX timing: HMAC block stream data_blocks=%lu bytes=%u",
+    KDBX_LOGD(TAG, "KDBX timing: HMAC block stream data_blocks=%lu bytes=%u",
              (unsigned long)data_block_count,
              (unsigned int)len);
     kdbx_log_elapsed("read HMAC block stream", start_us);
@@ -109,7 +130,9 @@ static esp_err_t decrypt_aes_cbc_payload(const kdbx_header_t *header,
                                          size_t *out_plain_len)
 {
     int64_t start_us = kdbx_now_us();
-    if (!header->has_encryption_iv) {
+    if (!header->has_encryption_iv || header->encryption_iv_len != 16) {
+        ESP_LOGW(TAG, "AES-CBC requires a 16-byte IV, got %u",
+                 (unsigned int)header->encryption_iv_len);
         kdbx_log_elapsed("AES-CBC payload decrypt failed missing IV", start_us);
         return ESP_ERR_INVALID_STATE;
     }
@@ -181,15 +204,122 @@ static esp_err_t decrypt_aes_cbc_payload(const kdbx_header_t *header,
         }
     }
     plain_len -= pad;
+    plain[plain_len] = '\0';
 
     *out_plain = plain;
     *out_plain_len = plain_len;
-    ESP_LOGI(TAG, "KDBX timing: AES-CBC encrypted=%u plain=%u padding=%u",
+    KDBX_LOGD(TAG, "KDBX timing: AES-CBC encrypted=%u plain=%u padding=%u",
              (unsigned int)encrypted_len,
              (unsigned int)plain_len,
              pad);
     kdbx_log_elapsed("AES-CBC payload decrypt", start_us);
     return ESP_OK;
+}
+
+static esp_err_t decrypt_chacha20_payload(const kdbx_header_t *header,
+                                          const uint8_t master_key[32],
+                                          const uint8_t *encrypted,
+                                          size_t encrypted_len,
+                                          uint8_t **out_plain,
+                                          size_t *out_plain_len)
+{
+    int64_t start_us = kdbx_now_us();
+    if (!header->has_encryption_iv || header->encryption_iv_len != 12) {
+        ESP_LOGW(TAG, "ChaCha20 requires a 12-byte nonce, got %u",
+                 (unsigned int)header->encryption_iv_len);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (encrypted_len == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    uint8_t *plain = malloc(encrypted_len + 1);
+    if (!plain) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    mbedtls_chacha20_context chacha20;
+    mbedtls_chacha20_init(&chacha20);
+    int ret = mbedtls_chacha20_setkey(&chacha20, master_key);
+    if (ret == 0) {
+        ret = mbedtls_chacha20_starts(&chacha20, header->encryption_iv, 0);
+    }
+
+    for (size_t offset = 0; ret == 0 && offset < encrypted_len;) {
+        size_t chunk_len = encrypted_len - offset;
+        if (chunk_len > 4096) {
+            chunk_len = 4096;
+        }
+        ret = mbedtls_chacha20_update(&chacha20,
+                                      chunk_len,
+                                      encrypted + offset,
+                                      plain + offset);
+        offset += chunk_len;
+        if (ret == 0 && offset < encrypted_len) {
+            kdbx_crypto_cooperate();
+        }
+    }
+    mbedtls_chacha20_free(&chacha20);
+
+    if (ret != 0) {
+        free(plain);
+        ESP_LOGW(TAG, "ChaCha20 payload decrypt failed: %d", ret);
+        return ESP_FAIL;
+    }
+
+    plain[encrypted_len] = '\0';
+    *out_plain = plain;
+    *out_plain_len = encrypted_len;
+    KDBX_LOGD(TAG, "KDBX timing: ChaCha20 encrypted=%u plain=%u",
+              (unsigned int)encrypted_len,
+              (unsigned int)encrypted_len);
+    kdbx_log_elapsed("ChaCha20 payload decrypt", start_us);
+    return ESP_OK;
+}
+
+static bool cipher_id_equals(const kdbx_header_t *header, const uint8_t expected[16])
+{
+    return header->has_cipher_id &&
+           memcmp(header->cipher_id, expected, sizeof(header->cipher_id)) == 0;
+}
+
+static esp_err_t decrypt_payload_bytes(const kdbx_header_t *header,
+                                       const uint8_t master_key[32],
+                                       const uint8_t *encrypted,
+                                       size_t encrypted_len,
+                                       uint8_t **out_plain,
+                                       size_t *out_plain_len)
+{
+    static const uint8_t aes_cipher_id[16] = {
+        0x31, 0xc1, 0xf2, 0xe6, 0xbf, 0x71, 0x43, 0x50,
+        0xbe, 0x58, 0x05, 0x21, 0x6a, 0xfc, 0x5a, 0xff,
+    };
+    static const uint8_t chacha20_cipher_id[16] = {
+        0xd6, 0x03, 0x8a, 0x2b, 0x8b, 0x6f, 0x4c, 0xb5,
+        0xa5, 0x24, 0x33, 0x9a, 0x31, 0xdb, 0xb5, 0x9a,
+    };
+
+    if (cipher_id_equals(header, aes_cipher_id)) {
+        KDBX_LOGD(TAG, "KDBX outer cipher: AES-256-CBC");
+        return decrypt_aes_cbc_payload(header,
+                                       master_key,
+                                       encrypted,
+                                       encrypted_len,
+                                       out_plain,
+                                       out_plain_len);
+    }
+    if (cipher_id_equals(header, chacha20_cipher_id)) {
+        KDBX_LOGD(TAG, "KDBX outer cipher: ChaCha20");
+        return decrypt_chacha20_payload(header,
+                                        master_key,
+                                        encrypted,
+                                        encrypted_len,
+                                        out_plain,
+                                        out_plain_len);
+    }
+
+    ESP_LOGW(TAG, "Unsupported or missing KDBX outer cipher");
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 static esp_err_t protected_stream_init(kdbx_protected_stream_t *stream, const kdbx_inner_header_t *inner)
@@ -222,7 +352,7 @@ static esp_err_t protected_stream_init(kdbx_protected_stream_t *stream, const kd
     }
 
     stream->ready = true;
-    ESP_LOGI(TAG, "KDBX protected stream initialized: ChaCha20");
+    KDBX_LOGD(TAG, "KDBX protected stream initialized: ChaCha20");
     return ESP_OK;
 }
 
@@ -296,7 +426,7 @@ static esp_err_t parse_inner_header(const uint8_t *plain,
             return ESP_ERR_INVALID_SIZE;
         }
 
-        ESP_LOGI(TAG, "KDBX inner header field id=%u size=%lu",
+        KDBX_LOGD(TAG, "KDBX inner header field id=%u size=%lu",
                  field_id,
                  (unsigned long)field_size);
 
@@ -307,7 +437,7 @@ static esp_err_t parse_inner_header(const uint8_t *plain,
 
         if (field_id == 1 && field_size == 4) {
             inner->random_stream_id = kdbx_read_le32(plain + offset);
-            ESP_LOGI(TAG, "InnerRandomStreamID=%lu", (unsigned long)inner->random_stream_id);
+            KDBX_LOGD(TAG, "InnerRandomStreamID=%lu", (unsigned long)inner->random_stream_id);
         } else if (field_id == 2) {
             size_t copy_len = field_size < sizeof(inner->random_stream_key) ? field_size : sizeof(inner->random_stream_key);
             memcpy(inner->random_stream_key, plain + offset, copy_len);
@@ -315,7 +445,7 @@ static esp_err_t parse_inner_header(const uint8_t *plain,
             inner->has_random_stream_key = true;
             kdbx_log_hex_value("InnerRandomStreamKey", plain + offset, field_size);
         } else if (field_id == 3) {
-            ESP_LOGI(TAG, "InnerBinary len=%lu", (unsigned long)field_size);
+            KDBX_LOGD(TAG, "InnerBinary len=%lu", (unsigned long)field_size);
         }
 
         offset += field_size;
@@ -382,7 +512,7 @@ static esp_err_t inflate_gzip_payload(const uint8_t *gzip,
     }
 
     uint32_t expected_len = kdbx_read_le32(gzip + gzip_len - 4);
-    if (expected_len > 0 && expected_len <= 262144) {
+    if (expected_len > 0 && expected_len <= KDBX_MAX_XML_SIZE) {
         uint8_t *xml = malloc((size_t)expected_len + 1);
         if (!xml) {
             kdbx_log_elapsed("inflate gzip payload failed no memory", start_us);
@@ -398,7 +528,7 @@ static esp_err_t inflate_gzip_payload(const uint8_t *gzip,
             xml[written] = '\0';
             *out_xml = xml;
             *out_xml_len = written;
-            ESP_LOGI(TAG, "KDBX timing: gzip compressed=%u deflate=%u inflated=%u expected=%u",
+            KDBX_LOGD(TAG, "KDBX timing: gzip compressed=%u deflate=%u inflated=%u expected=%u",
                      (unsigned int)gzip_len,
                      (unsigned int)deflate_len,
                      (unsigned int)written,
@@ -410,7 +540,7 @@ static esp_err_t inflate_gzip_payload(const uint8_t *gzip,
         free(xml);
     }
 
-    for (size_t capacity = 8192; capacity <= 262144; capacity *= 2) {
+    for (size_t capacity = 8192; capacity <= KDBX_MAX_XML_SIZE; capacity *= 2) {
         uint8_t *xml = malloc(capacity + 1);
         if (!xml) {
             kdbx_log_elapsed("inflate gzip payload failed no memory", start_us);
@@ -426,7 +556,7 @@ static esp_err_t inflate_gzip_payload(const uint8_t *gzip,
             xml[written] = '\0';
             *out_xml = xml;
             *out_xml_len = written;
-            ESP_LOGI(TAG, "KDBX timing: gzip compressed=%u deflate=%u inflated=%u capacity=%u",
+            KDBX_LOGD(TAG, "KDBX timing: gzip compressed=%u deflate=%u inflated=%u capacity=%u",
                      (unsigned int)gzip_len,
                      (unsigned int)deflate_len,
                      (unsigned int)written,
@@ -534,6 +664,38 @@ static void log_xml_summary(const uint8_t *xml, size_t xml_len)
 #endif
 }
 
+static void log_decrypted_xml(const uint8_t *xml, size_t xml_len)
+{
+#if KDBX_DUMP_DECRYPTED_XML
+    enum { XML_LOG_CHUNK_SIZE = 240 };
+    char chunk[XML_LOG_CHUNK_SIZE + 1];
+
+    ESP_LOGW(TAG, "KDBX XML dump enabled; output may contain sensitive data");
+    ESP_LOGI(TAG, "========== KDBX XML BEGIN len=%u ==========", (unsigned)xml_len);
+    for (size_t offset = 0; offset < xml_len; offset += XML_LOG_CHUNK_SIZE) {
+        size_t chunk_len = xml_len - offset;
+        if (chunk_len > XML_LOG_CHUNK_SIZE) chunk_len = XML_LOG_CHUNK_SIZE;
+        memcpy(chunk, xml + offset, chunk_len);
+        chunk[chunk_len] = '\0';
+
+        /* Keep every serial record on one line so offsets remain searchable. */
+        for (size_t i = 0; i < chunk_len; i++) {
+            if (chunk[i] == '\r' || chunk[i] == '\n' || chunk[i] == '\t') {
+                chunk[i] = ' ';
+            }
+        }
+        ESP_LOGI(TAG, "KDBX_XML[%06u]: %s", (unsigned)offset, chunk);
+        if (((offset / XML_LOG_CHUNK_SIZE) & 0x07U) == 0x07U) {
+            kdbx_crypto_cooperate();
+        }
+    }
+    ESP_LOGI(TAG, "========== KDBX XML END ==========");
+#else
+    (void)xml;
+    (void)xml_len;
+#endif
+}
+
 static bool copy_between(const char *start,
                          const char *end,
                          const char *open_tag,
@@ -562,6 +724,23 @@ static bool copy_between(const char *start,
     return true;
 }
 
+static bool range_contains(const char *start, const char *end, const char *needle)
+{
+    size_t range_len = (size_t)(end - start);
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0 || needle_len > range_len) {
+        return false;
+    }
+
+    const char *last = end - needle_len;
+    for (const char *cursor = start; cursor <= last; cursor++) {
+        if (memcmp(cursor, needle, needle_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool copy_xml_value_text(const char *string_start,
                                 const char *string_end,
                                 char *out,
@@ -578,8 +757,10 @@ static bool copy_xml_value_text(const char *string_start,
         return false;
     }
 
-    *out_protected = strstr(value_open, "Protected=\"True\"") != NULL ||
-                     strstr(value_open, "Protected=\"true\"") != NULL;
+    *out_protected = range_contains(value_open, value_text, "Protected=\"True\"") ||
+                     range_contains(value_open, value_text, "Protected=\"true\"") ||
+                     range_contains(value_open, value_text, "Protected='True'") ||
+                     range_contains(value_open, value_text, "Protected='true'");
 
     value_text++;
     const char *value_close = strstr(value_text, "</Value>");
@@ -631,11 +812,48 @@ static void xml_unescape_in_place(char *text)
     *write = '\0';
 }
 
-static void parse_entry_string_fields(const char *entry_start,
-                                      const char *entry_end,
-                                      unsigned int entry_index,
-                                      kdbx_protected_stream_t *protected_stream,
-                                      kdbx_entry_sink_t *sink)
+static const char *find_matching_entry_end(const char *entry_start)
+{
+    size_t depth = 0;
+    const char *cursor = entry_start;
+    while ((cursor = strchr(cursor, '<')) != NULL) {
+        if (strncmp(cursor, "<Entry>", 7) == 0) {
+            depth++;
+            cursor += 7;
+        } else if (strncmp(cursor, "</Entry>", 8) == 0) {
+            if (depth == 0) return NULL;
+            depth--;
+            if (depth == 0) return cursor;
+            cursor += 8;
+        } else {
+            cursor++;
+        }
+    }
+    return NULL;
+}
+
+static void parse_totp_settings(const char *value, uint16_t *period, uint8_t *digits)
+{
+    char *end = NULL;
+    unsigned long parsed_period = strtoul(value, &end, 10);
+    if (end == value || (*end != ';' && *end != ',')) return;
+    const char *digits_text = end + 1;
+    unsigned long parsed_digits = strtoul(digits_text, &end, 10);
+    if (end == digits_text || parsed_period == 0 || parsed_period > UINT16_MAX ||
+        parsed_digits < 6 || parsed_digits > 8) {
+        return;
+    }
+    *period = (uint16_t)parsed_period;
+    *digits = (uint8_t)parsed_digits;
+}
+
+static esp_err_t parse_entry_string_fields(const char *entry_start,
+                                           const char *entry_end,
+                                           unsigned int entry_index,
+                                           const char *group_name,
+                                           size_t group_index,
+                                           kdbx_protected_stream_t *protected_stream,
+                                           kdbx_entry_sink_t *sink)
 {
 #if !KDBX_VERBOSE_LOG
     (void)entry_index;
@@ -644,8 +862,27 @@ static void parse_entry_string_fields(const char *entry_start,
     char username[96] = "";
     char url[128] = "";
     char password[128] = "";
+    char otp_uri[256] = "";
+    char totp_secret[160] = "";
+    char totp_algorithm[16] = "";
+    uint16_t totp_period = 0;
+    uint8_t totp_digits = 0;
+    kdbx_totp_secret_encoding_t totp_secret_encoding = KDBX_TOTP_SECRET_BASE32;
+    uint32_t icon_id = 0;
     bool password_protected = false;
 
+    const char *history = strstr(entry_start, "<History>");
+    const char *fields_end = history && history < entry_end ? history : entry_end;
+    char icon_id_text[16];
+    if (copy_between(entry_start, fields_end, "<IconID>", "</IconID>",
+                     icon_id_text, sizeof(icon_id_text))) {
+        char *icon_id_end = NULL;
+        unsigned long parsed_icon_id = strtoul(icon_id_text, &icon_id_end, 10);
+        if (icon_id_end != icon_id_text && *icon_id_end == '\0' &&
+            parsed_icon_id <= UINT32_MAX) {
+            icon_id = (uint32_t)parsed_icon_id;
+        }
+    }
     const char *cursor = entry_start;
     while ((cursor = strstr(cursor, "<String>")) != NULL && cursor < entry_end) {
         const char *string_end = strstr(cursor, "</String>");
@@ -654,7 +891,7 @@ static void parse_entry_string_fields(const char *entry_start,
         }
 
         char key[32];
-        char value[128];
+        char value[256];
         bool value_protected = false;
         if (copy_between(cursor, string_end, "<Key>", "</Key>", key, sizeof(key)) &&
             copy_xml_value_text(cursor, string_end, value, sizeof(value), &value_protected)) {
@@ -672,7 +909,10 @@ static void parse_entry_string_fields(const char *entry_start,
                 xml_unescape_in_place(value);
             }
 
-            if (strcmp(key, "Title") == 0) {
+            if (cursor >= fields_end) {
+                cursor = string_end + strlen("</String>");
+                continue;
+            } else if (strcmp(key, "Title") == 0) {
                 strlcpy(title, value, sizeof(title));
             } else if (strcmp(key, "UserName") == 0) {
                 strlcpy(username, value, sizeof(username));
@@ -681,6 +921,41 @@ static void parse_entry_string_fields(const char *entry_start,
             } else if (strcmp(key, "Password") == 0) {
                 strlcpy(password, value, sizeof(password));
                 password_protected = value_protected && !protected_decoded;
+            } else if ((!value_protected || protected_decoded) &&
+                       (strcasecmp(key, "otp") == 0 || strcasecmp(key, "TOTP") == 0)) {
+                if (strncasecmp(value, "otpauth://", 10) == 0) {
+                    strlcpy(otp_uri, value, sizeof(otp_uri));
+                } else {
+                    strlcpy(totp_secret, value, sizeof(totp_secret));
+                    totp_secret_encoding = KDBX_TOTP_SECRET_BASE32;
+                }
+            } else if ((!value_protected || protected_decoded) &&
+                       strcmp(key, "TimeOtp-Secret-Base32") == 0) {
+                strlcpy(totp_secret, value, sizeof(totp_secret));
+                totp_secret_encoding = KDBX_TOTP_SECRET_BASE32;
+            } else if ((!value_protected || protected_decoded) &&
+                       strcmp(key, "TimeOtp-Secret-Base64") == 0) {
+                strlcpy(totp_secret, value, sizeof(totp_secret));
+                totp_secret_encoding = KDBX_TOTP_SECRET_BASE64;
+            } else if ((!value_protected || protected_decoded) &&
+                       strcmp(key, "TimeOtp-Secret-Hex") == 0) {
+                strlcpy(totp_secret, value, sizeof(totp_secret));
+                totp_secret_encoding = KDBX_TOTP_SECRET_HEX;
+            } else if ((!value_protected || protected_decoded) &&
+                       (strcasecmp(key, "TOTP Seed") == 0 ||
+                        strcasecmp(key, "TOTP Secret") == 0)) {
+                strlcpy(totp_secret, value, sizeof(totp_secret));
+                totp_secret_encoding = KDBX_TOTP_SECRET_BASE32;
+            } else if (strcmp(key, "TimeOtp-Algorithm") == 0) {
+                strlcpy(totp_algorithm, value, sizeof(totp_algorithm));
+            } else if (strcmp(key, "TimeOtp-Period") == 0) {
+                unsigned long parsed = strtoul(value, NULL, 10);
+                if (parsed > 0 && parsed <= UINT16_MAX) totp_period = (uint16_t)parsed;
+            } else if (strcmp(key, "TimeOtp-Length") == 0) {
+                unsigned long parsed = strtoul(value, NULL, 10);
+                if (parsed >= 6 && parsed <= 8) totp_digits = (uint8_t)parsed;
+            } else if (strcasecmp(key, "TOTP Settings") == 0) {
+                parse_totp_settings(value, &totp_period, &totp_digits);
             }
         }
 
@@ -698,37 +973,66 @@ static void parse_entry_string_fields(const char *entry_start,
              (unsigned int)strlen(password));
 #endif
 
+    if (!kdbx_try_increment_group_entry_count(group_index)) {
+        ESP_LOGW(TAG, "KDBX group '%s' exceeds %u entries",
+                 group_name ? group_name : "",
+                 (unsigned)KDBX_MAX_ENTRIES_PER_GROUP);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     if (*sink->entry_count < sink->max_entries) {
-        kdbx_entry_t *entry = &sink->entries[(*sink->entry_count)++];
+        size_t stored_index = *sink->entry_count;
+        kdbx_entry_t *entry = &sink->entries[stored_index];
         const char *entry_title = title[0] ? title : (username[0] ? username : "(no title)");
+        memset(entry, 0, sizeof(*entry));
         strlcpy(entry->title, entry_title, sizeof(entry->title));
         strlcpy(entry->username, username, sizeof(entry->username));
         strlcpy(entry->url, url, sizeof(entry->url));
         strlcpy(entry->password, password, sizeof(entry->password));
+        strlcpy(entry->group, group_name ? group_name : "", sizeof(entry->group));
+        strlcpy(entry->otp_uri, otp_uri, sizeof(entry->otp_uri));
+        strlcpy(entry->totp_secret, totp_secret, sizeof(entry->totp_secret));
+        strlcpy(entry->totp_algorithm, totp_algorithm, sizeof(entry->totp_algorithm));
+        entry->totp_period = totp_period;
+        entry->totp_digits = totp_digits;
+        entry->totp_secret_encoding = totp_secret_encoding;
+        entry->icon_id = icon_id;
+        entry->group_index = group_index;
         entry->password_protected = password_protected;
+        *sink->entry_count = stored_index + 1;
+        kdbx_publish_entry_count(*sink->entry_count);
+        if (entry->otp_uri[0] || entry->totp_secret[0]) {
+            const char *source = entry->otp_uri[0] ? "otpauth URI" :
+                                 entry->totp_secret_encoding == KDBX_TOTP_SECRET_BASE64 ? "Base64" :
+                                 entry->totp_secret_encoding == KDBX_TOTP_SECRET_HEX ? "Hex" : "Base32";
+            ESP_LOGI(TAG, "KDBX entry %u contains TOTP (%s)", entry_index, source);
+        }
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "KDBX database exceeds device entry capacity: %u",
+             (unsigned)sink->max_entries);
+    return ESP_ERR_INVALID_SIZE;
+}
+
+static void parse_group_name(const char *group_start, const char *next_child, char *name, size_t name_len)
+{
+    name[0] = '\0';
+    if (copy_between(group_start, next_child, "<Name>", "</Name>", name, name_len)) {
+        xml_unescape_in_place(name);
     }
 }
 
-static void parse_kdbx_entries(const uint8_t *xml,
-                               size_t xml_len,
-                               const kdbx_inner_header_t *inner,
-                               kdbx_entry_t *entries,
-                               size_t *entry_count,
-                               size_t max_entries)
+static esp_err_t parse_kdbx_entries(const uint8_t *xml,
+                                     size_t xml_len,
+                                     const kdbx_inner_header_t *inner,
+                                     kdbx_entry_t *entries,
+                                     size_t *entry_count,
+                                     size_t max_entries)
 {
     int64_t start_us = kdbx_now_us();
-    char *text = malloc(xml_len + 1);
-    if (!text) {
-        ESP_LOGW(TAG, "No memory to parse KDBX entries");
-        kdbx_log_elapsed("parse KDBX XML entries failed no memory", start_us);
-        return;
-    }
-
-    memcpy(text, xml, xml_len);
-    text[xml_len] = '\0';
-
+    const char *text = (const char *)xml;
     *entry_count = 0;
-    memset(entries, 0, sizeof(entries[0]) * max_entries);
 
     kdbx_entry_sink_t sink = {
         .entries = entries,
@@ -743,32 +1047,90 @@ static void parse_kdbx_entries(const uint8_t *xml,
     }
 
     unsigned int entry_index = 0;
+    size_t parsed_group_count = 0;
+    kdbx_group_stack_item_t group_stack[KDBX_MAX_GROUPS] = {0};
+    size_t group_depth = 0;
     const char *cursor = text;
-    while ((cursor = strstr(cursor, "<Entry>")) != NULL) {
-        const char *entry_end = strstr(cursor, "</Entry>");
-        if (!entry_end) {
-            break;
-        }
+    while ((cursor = strchr(cursor, '<')) != NULL) {
+        if (strncmp(cursor, "<Group>", 7) == 0) {
+            parsed_group_count++;
+            if (parsed_group_count > KDBX_MAX_GROUPS) {
+                ESP_LOGW(TAG, "KDBX database exceeds group limit: %u",
+                         (unsigned)KDBX_MAX_GROUPS);
+                protected_stream_free(&protected_stream);
+                return ESP_ERR_INVALID_SIZE;
+            }
+            const char *next_group = strstr(cursor + 7, "<Group>");
+            const char *next_entry = strstr(cursor + 7, "<Entry>");
+            const char *group_end = strstr(cursor + 7, "</Group>");
+            const char *next_child = group_end;
+            if (next_group && (!next_child || next_group < next_child)) next_child = next_group;
+            if (next_entry && (!next_child || next_entry < next_child)) next_child = next_entry;
+            if (!next_child) break;
 
-        entry_index++;
-        parse_entry_string_fields(cursor, entry_end, entry_index, &protected_stream, &sink);
-        cursor = entry_end + strlen("</Entry>");
-        if (*entry_count >= max_entries) {
-            break;
+            if (group_depth >= sizeof(group_stack) / sizeof(group_stack[0])) {
+                ESP_LOGW(TAG, "KDBX group nesting exceeds limit: %u",
+                         (unsigned)KDBX_MAX_GROUPS);
+                protected_stream_free(&protected_stream);
+                return ESP_ERR_INVALID_SIZE;
+            }
+
+            char group_name[64];
+            parse_group_name(cursor, next_child, group_name, sizeof(group_name));
+            size_t parent_index = group_depth ? group_stack[group_depth - 1].index : SIZE_MAX;
+            group_stack[group_depth].index = kdbx_add_group(group_name,
+                                                            (uint8_t)group_depth,
+                                                            parent_index);
+            group_depth++;
+            cursor += 7;
+        } else if (strncmp(cursor, "</Group>", 8) == 0) {
+            if (group_depth > 0) group_depth--;
+            cursor += 8;
+        } else if (strncmp(cursor, "<Entry>", 7) == 0) {
+            const char *entry_end = find_matching_entry_end(cursor);
+            if (!entry_end) break;
+            entry_index++;
+            size_t group_index = group_depth ? group_stack[group_depth - 1].index : SIZE_MAX;
+            const kdbx_group_t *group = kdbx_get_group(group_index);
+            const char *group_name = group ? group->name : "";
+            esp_err_t entry_ret = parse_entry_string_fields(cursor, entry_end, entry_index,
+                                                            group_name, group_index,
+                                                            &protected_stream, &sink);
+            if (entry_ret != ESP_OK) {
+                protected_stream_free(&protected_stream);
+                return entry_ret;
+            }
+            cursor = entry_end + strlen("</Entry>");
+        } else {
+            cursor++;
         }
         if ((entry_index & 0x03) == 0) {
             kdbx_crypto_cooperate();
         }
     }
 
-    ESP_LOGI(TAG, "KDBX parsed entries=%u", entry_index);
+    size_t totp_count = 0;
+    for (size_t i = 0; i < *entry_count; i++) {
+        if (entries[i].otp_uri[0] || entries[i].totp_secret[0]) totp_count++;
+    }
+    ESP_LOGI(TAG, "KDBX parsed entries=%u stored=%u TOTP=%u",
+             entry_index, (unsigned)*entry_count, (unsigned)totp_count);
+    if (entry_index > *entry_count) {
+        ESP_LOGW(TAG, "KDBX entry list truncated: parsed=%u capacity=%u",
+                 entry_index, (unsigned)max_entries);
+    }
     protected_stream_free(&protected_stream);
-    free(text);
-    ESP_LOGI(TAG, "KDBX timing: parsed_xml_len=%u stored_entries=%u max_entries=%u",
+    KDBX_LOGD(TAG, "KDBX timing: parsed_xml_len=%u stored_entries=%u max_entries=%u",
              (unsigned int)xml_len,
              (unsigned int)*entry_count,
              (unsigned int)max_entries);
     kdbx_log_elapsed("parse KDBX XML entries", start_us);
+    if (*entry_count == 0 && kdbx_get_group_count() == 0) {
+        ESP_LOGW(TAG, "KDBX XML contains no recognized groups or entries (len=%u)",
+                 (unsigned)xml_len);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
 }
 
 static void parse_payload_body(const kdbx_header_t *header,
@@ -786,13 +1148,15 @@ static void parse_payload_body(const kdbx_header_t *header,
     kdbx_log_elapsed("parse KDBX inner header", start_us);
     if (*ret == ESP_OK && xml_offset <= plain_len) {
         size_t xml_len = plain_len - xml_offset;
-        ESP_LOGI(TAG, "KDBX payload data after inner header len=%u compression=%lu",
+        KDBX_LOGD(TAG, "KDBX payload data after inner header len=%u compression=%lu",
                  (unsigned int)xml_len,
                  (unsigned long)header->compression_flags);
         kdbx_log_hex_value("KDBX payload data", plain + xml_offset, xml_len);
         log_xml_summary(plain + xml_offset, xml_len);
+        log_decrypted_xml(plain + xml_offset, xml_len);
         start_us = kdbx_now_us();
-        parse_kdbx_entries(plain + xml_offset, xml_len, &inner, entries, entry_count, max_entries);
+        *ret = parse_kdbx_entries(plain + xml_offset, xml_len, &inner,
+                                  entries, entry_count, max_entries);
         kdbx_log_elapsed("parse payload XML body", start_us);
     }
 }
@@ -836,13 +1200,21 @@ esp_err_t kdbx_decrypt_payload(FILE *f,
 
     kdbx_log_hex_value("KDBX header SHA256 stored", header_hash, sizeof(header_hash));
     kdbx_log_hex_value("KDBX header SHA256 calculated", calculated_header_hash, sizeof(calculated_header_hash));
-    ESP_LOGI(TAG, "KDBX header SHA256 match=%s",
-             memcmp(header_hash, calculated_header_hash, sizeof(header_hash)) == 0 ? "yes" : "no");
+    if (memcmp(header_hash, calculated_header_hash, sizeof(header_hash)) != 0) {
+        ESP_LOGW(TAG, "KDBX header SHA256 mismatch; database header is corrupted");
+        kdbx_log_elapsed("decrypt payload failed header hash", total_start_us);
+        return ESP_ERR_INVALID_CRC;
+    }
+    KDBX_LOGD(TAG, "KDBX header SHA256 match=yes");
 
     kdbx_log_hex_value("KDBX header HMAC stored", header_hmac, sizeof(header_hmac));
     kdbx_log_hex_value("KDBX header HMAC calculated", calculated_header_hmac, sizeof(calculated_header_hmac));
-    ESP_LOGI(TAG, "KDBX header HMAC match=%s",
-             memcmp(header_hmac, calculated_header_hmac, sizeof(header_hmac)) == 0 ? "yes" : "no");
+    if (memcmp(header_hmac, calculated_header_hmac, sizeof(header_hmac)) != 0) {
+        ESP_LOGW(TAG, "KDBX authentication failed: password is incorrect or an additional key file is required");
+        kdbx_log_elapsed("decrypt payload failed header HMAC", total_start_us);
+        return ESP_ERR_INVALID_CRC;
+    }
+    KDBX_LOGD(TAG, "KDBX header HMAC match=yes");
 
     uint8_t *encrypted = NULL;
     size_t encrypted_len = 0;
@@ -854,16 +1226,16 @@ esp_err_t kdbx_decrypt_payload(FILE *f,
         return ret;
     }
 
-    ESP_LOGI(TAG, "KDBX encrypted payload len=%u", (unsigned int)encrypted_len);
+    KDBX_LOGD(TAG, "KDBX encrypted payload len=%u", (unsigned int)encrypted_len);
 
     uint8_t *plain = NULL;
     size_t plain_len = 0;
     step_start_us = kdbx_now_us();
-    ret = decrypt_aes_cbc_payload(header, master_key, encrypted, encrypted_len, &plain, &plain_len);
+    ret = decrypt_payload_bytes(header, master_key, encrypted, encrypted_len, &plain, &plain_len);
     kdbx_log_elapsed("decrypt encrypted payload bytes", step_start_us);
     free(encrypted);
     if (ret != ESP_OK) {
-        kdbx_log_elapsed("decrypt payload total failed AES-CBC", total_start_us);
+        kdbx_log_elapsed("decrypt payload total failed outer cipher", total_start_us);
         return ret;
     }
 

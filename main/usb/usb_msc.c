@@ -12,9 +12,11 @@
 #include "class/hid/hid_device.h"
 #include "canokey_esp32p4.h"
 #include "ctaphid.h"
+#include "usb_ncm/usb_ncm.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_partition.h"
+#include "log_storage.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -27,6 +29,7 @@
 #include "tinyusb_default_config.h"
 #include "tinyusb_msc.h"
 #include "usb_ccid.h"
+#include "keyboard_layout.h"
 #include "usbd_ctaphid.h"
 #include "wear_levelling.h"
 
@@ -37,6 +40,9 @@
 #define HID_REPORT_INTERVAL_MS  25
 #define HID_MOUNT_TIMEOUT_MS    3000
 #define HID_REPORT_TIMEOUT_MS   1000
+#define USB_DISCONNECT_DELAY_MS 500
+#define USB_REINSTALL_DELAY_MS  100
+#define USB_ENUM_SETTLE_MS      500
 #define MSC_DUMP_TASK_STACK     4096
 #define MSC_DUMP_TASK_PRIORITY  4
 #define MSC_DUMP_CHUNK_SIZE     128
@@ -80,9 +86,12 @@
 
 #define HID_STR_INDEX           4
 #define CTAPHID_STR_INDEX       5
+#define AUX_INTERFACE_STR_INDEX 7
 #if USB_MSC_DEFAULT_ENABLED
-#define MSC_STR_INDEX           6
+#define MSC_STR_INDEX           AUX_INTERFACE_STR_INDEX
 #endif
+#define NCM_MAC_STR_INDEX       6
+#define NCM_STR_INDEX           AUX_INTERFACE_STR_INDEX
 
 #define HID_EP_IN               0x81
 #define CTAPHID_EP_OUT          0x03
@@ -122,11 +131,32 @@
 #define MSC_PARTITION_LABEL     "usbstore"
 #define MSC_NVS_NAMESPACE       "usbstore"
 #define MSC_NVS_FORMAT_KEY      "fmt_v2_done"
+#define CONNECT_SETTINGS_NVS_NAMESPACE "connect_ui"
+#define CONNECT_HID_LAYOUT_NVS_KEY    "hid_layout"
+#define CONNECT_USB_VID_NVS_KEY       "usb_vid"
+#define USB_VID_DEFAULT               0x303AU
+#define USB_VID_MIN                   0x0001U
+#define USB_VID_MAX                   0xFFFEU
+#define MSC_ERASE_CHUNK_SECTORS 16U
+#define MSC_ERASE_LOG_BYTES     (1024U * 1024U)
 
 static const char *TAG = "usb_hid";
 static esp_err_t usbstore_set_mount_point(tinyusb_msc_mount_point_t mount_point);
 
+typedef enum {
+    HID_MESSAGE_TEXT,
+    HID_MESSAGE_KEY_PRESS,
+    HID_MESSAGE_KEY_RELEASE,
+    HID_MESSAGE_DELAY,
+    HID_MESSAGE_SYNC,
+} hid_message_type_t;
+
 typedef struct {
+    hid_message_type_t type;
+    uint8_t key;
+    uint8_t modifier;
+    uint32_t delay_ms;
+    TaskHandle_t waiter;
     char text[HID_TEXT_MAX_LEN];
 } hid_text_msg_t;
 
@@ -134,6 +164,8 @@ typedef enum {
     USB_MODE_HID_ONLY,
     USB_MODE_HID_CCID,
     USB_MODE_HID_MSC,
+    USB_MODE_HID_NCM,
+    USB_MODE_HID_JADE_CDC,
 } usb_mode_t;
 
 static QueueHandle_t s_hid_queue;
@@ -141,6 +173,8 @@ static bool s_hid_started;
 static bool s_dump_in_progress;
 static bool s_smartcard_reader_enabled;
 static bool s_usbstore_exposed_to_usb;
+static bool s_ncm_enabled;
+static bool s_jade_cdc_enabled;
 static usb_mode_t s_usb_mode = USB_MODE_HID_ONLY;
 static wl_handle_t s_msc_wl_handle = WL_INVALID_HANDLE;
 static tinyusb_msc_storage_handle_t s_msc_storage;
@@ -172,16 +206,19 @@ static const uint8_t s_ctaphid_report_descriptor[] = {
 /*修改 open PGP的名字  */
 static const char *s_hid_string_descriptor[] = {
     (char[]){0x09, 0x04},
-    "oylqrs",
-    "ESP32-P4 HID Keyboard + Flash Disk",
+    "Miixkey",
+    "MiixKey HID Keyboard + Flash Disk",
     "000001",
     "Keyboard",
     "FIDO2/U2F",
-    "Flash Disk",
-    "Smart Card Reader",
+    "021608000001",
+    "MIIX-USB",
 };
 
-static const tusb_desc_device_t s_usb_device_descriptor = {
+_Static_assert(sizeof(s_hid_string_descriptor) / sizeof(s_hid_string_descriptor[0]) <= 8,
+               "esp_tinyusb supports at most 8 USB string descriptors");
+
+static const tusb_desc_device_t s_usb_hid_device_descriptor = {
     .bLength = sizeof(tusb_desc_device_t),
     .bDescriptorType = TUSB_DESC_DEVICE,
     .bcdUSB = 0x0200,
@@ -190,8 +227,42 @@ static const tusb_desc_device_t s_usb_device_descriptor = {
     .bDeviceProtocol = 0x00,
     .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor = 0x303A,
-    .idProduct = 0x4006,
-    .bcdDevice = 0x0101,
+    .idProduct = 0x4010,
+    .bcdDevice = 0x0100,
+    .iManufacturer = 0x01,
+    .iProduct = 0x02,
+    .iSerialNumber = 0x03,
+    .bNumConfigurations = 0x01,
+};
+
+static const tusb_desc_device_t s_usb_ccid_device_descriptor = {
+    .bLength = sizeof(tusb_desc_device_t),
+    .bDescriptorType = TUSB_DESC_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = 0x00,
+    .bDeviceSubClass = 0x00,
+    .bDeviceProtocol = 0x00,
+    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor = 0x303A,
+    .idProduct = 0x4011,
+    .bcdDevice = 0x0100,
+    .iManufacturer = 0x01,
+    .iProduct = 0x02,
+    .iSerialNumber = 0x03,
+    .bNumConfigurations = 0x01,
+};
+
+static const tusb_desc_device_t s_usb_msc_device_descriptor = {
+    .bLength = sizeof(tusb_desc_device_t),
+    .bDescriptorType = TUSB_DESC_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = 0x00,
+    .bDeviceSubClass = 0x00,
+    .bDeviceProtocol = 0x00,
+    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor = 0x303A,
+    .idProduct = 0x4012,
+    .bcdDevice = 0x0100,
     .iManufacturer = 0x01,
     .iProduct = 0x02,
     .iSerialNumber = 0x03,
@@ -211,6 +282,7 @@ static const tusb_desc_device_qualifier_t s_usb_device_qualifier = {
     .bReserved = 0x00,
 };
 #endif
+
 static const uint8_t s_usb_configuration_descriptor_hid_fs[] = {
     TUD_CONFIG_DESCRIPTOR(1, 2, 0, TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN + TUD_HID_INOUT_DESC_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
     TUD_HID_DESCRIPTOR(HID_ITF_NUM_KEYBOARD, HID_STR_INDEX, false, sizeof(s_hid_report_descriptor), HID_EP_IN, 16, 10),
@@ -218,6 +290,42 @@ static const uint8_t s_usb_configuration_descriptor_hid_fs[] = {
                              sizeof(s_ctaphid_report_descriptor), CTAPHID_EP_OUT, CTAPHID_EP_IN,
                              CTAPHID_EP_SIZE, 5),
 };
+
+static const tusb_desc_device_t s_usb_ncm_device_descriptor = {
+    .bLength = sizeof(tusb_desc_device_t),
+    .bDescriptorType = TUSB_DESC_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = TUSB_CLASS_MISC,
+    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol = MISC_PROTOCOL_IAD,
+    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor = 0x303A,
+    .idProduct = 0x4013,
+    .bcdDevice = 0x0100,
+    .iManufacturer = 0x01,
+    .iProduct = 0x02,
+    .iSerialNumber = 0x03,
+    .bNumConfigurations = 0x01,
+};
+
+static const tusb_desc_device_t s_usb_jade_device_descriptor = {
+    .bLength = sizeof(tusb_desc_device_t),
+    .bDescriptorType = TUSB_DESC_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = TUSB_CLASS_MISC,
+    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol = MISC_PROTOCOL_IAD,
+    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor = 0x303A,
+    .idProduct = 0x4014,
+    .bcdDevice = 0x0100,
+    .iManufacturer = 0x01,
+    .iProduct = 0x02,
+    .iSerialNumber = 0x03,
+    .bNumConfigurations = 0x01,
+};
+
+static tusb_desc_device_t s_usb_active_device_descriptor;
 
 #if (TUD_OPT_HIGH_SPEED)
 static const uint8_t s_usb_configuration_descriptor_hid_hs[] = {
@@ -227,6 +335,74 @@ static const uint8_t s_usb_configuration_descriptor_hid_hs[] = {
                              sizeof(s_ctaphid_report_descriptor), CTAPHID_EP_OUT, CTAPHID_EP_IN,
                              CTAPHID_EP_SIZE, 5),
 };
+
+static const tusb_desc_device_qualifier_t s_usb_ncm_device_qualifier = {
+    .bLength = sizeof(tusb_desc_device_qualifier_t),
+    .bDescriptorType = TUSB_DESC_DEVICE_QUALIFIER,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = TUSB_CLASS_MISC,
+    .bDeviceSubClass = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol = MISC_PROTOCOL_IAD,
+    .bMaxPacketSize0 = CFG_TUD_ENDPOINT0_SIZE,
+    .bNumConfigurations = 0x01,
+    .bReserved = 0x00,
+};
+#endif
+
+static const uint8_t s_usb_configuration_descriptor_hid_ncm_fs[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 4, 0,
+                          TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN +
+                          TUD_HID_INOUT_DESC_LEN + TUD_CDC_NCM_DESC_LEN,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(HID_ITF_NUM_KEYBOARD, HID_STR_INDEX, false,
+                       sizeof(s_hid_report_descriptor), HID_EP_IN, 16, 10),
+    TUD_HID_INOUT_DESCRIPTOR(HID_ITF_NUM_CTAPHID, CTAPHID_STR_INDEX,
+                             HID_ITF_PROTOCOL_NONE, sizeof(s_ctaphid_report_descriptor),
+                             CTAPHID_EP_OUT, CTAPHID_EP_IN, CTAPHID_EP_SIZE, 5),
+    TUD_CDC_NCM_DESCRIPTOR(2, NCM_STR_INDEX, NCM_MAC_STR_INDEX,
+                           0x84, 64, 0x02, 0x82, 64, CFG_TUD_NET_MTU),
+};
+
+static const uint8_t s_usb_configuration_descriptor_hid_jade_fs[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 4, 0,
+                          TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN +
+                          TUD_HID_INOUT_DESC_LEN + TUD_CDC_DESC_LEN,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(HID_ITF_NUM_KEYBOARD, HID_STR_INDEX, false,
+                       sizeof(s_hid_report_descriptor), HID_EP_IN, 16, 10),
+    TUD_HID_INOUT_DESCRIPTOR(HID_ITF_NUM_CTAPHID, CTAPHID_STR_INDEX,
+                             HID_ITF_PROTOCOL_NONE, sizeof(s_ctaphid_report_descriptor),
+                             CTAPHID_EP_OUT, CTAPHID_EP_IN, CTAPHID_EP_SIZE, 5),
+    TUD_CDC_DESCRIPTOR(2, AUX_INTERFACE_STR_INDEX, 0x85, 8, 0x04, 0x84, 64),
+};
+
+#if (TUD_OPT_HIGH_SPEED)
+static const uint8_t s_usb_configuration_descriptor_hid_ncm_hs[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 4, 0,
+                          TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN +
+                          TUD_HID_INOUT_DESC_LEN + TUD_CDC_NCM_DESC_LEN,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(HID_ITF_NUM_KEYBOARD, HID_STR_INDEX, false,
+                       sizeof(s_hid_report_descriptor), HID_EP_IN, 16, 10),
+    TUD_HID_INOUT_DESCRIPTOR(HID_ITF_NUM_CTAPHID, CTAPHID_STR_INDEX,
+                             HID_ITF_PROTOCOL_NONE, sizeof(s_ctaphid_report_descriptor),
+                             CTAPHID_EP_OUT, CTAPHID_EP_IN, CTAPHID_EP_SIZE, 5),
+    TUD_CDC_NCM_DESCRIPTOR(2, NCM_STR_INDEX, NCM_MAC_STR_INDEX,
+                           0x84, 64, 0x02, 0x82, 512, CFG_TUD_NET_MTU),
+};
+
+static const uint8_t s_usb_configuration_descriptor_hid_jade_hs[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 4, 0,
+                          TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN +
+                          TUD_HID_INOUT_DESC_LEN + TUD_CDC_DESC_LEN,
+                          TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    TUD_HID_DESCRIPTOR(HID_ITF_NUM_KEYBOARD, HID_STR_INDEX, false,
+                       sizeof(s_hid_report_descriptor), HID_EP_IN, 16, 10),
+    TUD_HID_INOUT_DESCRIPTOR(HID_ITF_NUM_CTAPHID, CTAPHID_STR_INDEX,
+                             HID_ITF_PROTOCOL_NONE, sizeof(s_ctaphid_report_descriptor),
+                             CTAPHID_EP_OUT, CTAPHID_EP_IN, CTAPHID_EP_SIZE, 5),
+    TUD_CDC_DESCRIPTOR(2, AUX_INTERFACE_STR_INDEX, 0x85, 8, 0x04, 0x84, 512),
+};
 #endif
 
 static const uint8_t s_usb_configuration_descriptor_ccid_fs[] = {
@@ -235,7 +411,7 @@ static const uint8_t s_usb_configuration_descriptor_ccid_fs[] = {
     TUD_HID_INOUT_DESCRIPTOR(HID_ITF_NUM_CTAPHID, CTAPHID_STR_INDEX, HID_ITF_PROTOCOL_NONE,
                              sizeof(s_ctaphid_report_descriptor), CTAPHID_EP_OUT, CTAPHID_EP_IN,
                              CTAPHID_EP_SIZE, 5),
-    9, TUSB_DESC_INTERFACE, CCID_ITF_NUM, 0, 3, TUSB_CLASS_SMART_CARD, 0, 0, 7,
+    9, TUSB_DESC_INTERFACE, 2, 0, 3, TUSB_CLASS_SMART_CARD, 0, 0, AUX_INTERFACE_STR_INDEX,
     0x36, 0x21, 0x10, 0x01, 0x00, 0x07, 0x02, 0x00, 0x00, 0x00,
     0xA0, 0x0F, 0x00, 0x00,
     0xA0, 0x0F, 0x00, 0x00,
@@ -258,7 +434,7 @@ static const uint8_t s_usb_configuration_descriptor_ccid_hs[] = {
     TUD_HID_INOUT_DESCRIPTOR(HID_ITF_NUM_CTAPHID, CTAPHID_STR_INDEX, HID_ITF_PROTOCOL_NONE,
                              sizeof(s_ctaphid_report_descriptor), CTAPHID_EP_OUT, CTAPHID_EP_IN,
                              CTAPHID_EP_SIZE, 5),
-    9, TUSB_DESC_INTERFACE, CCID_ITF_NUM, 0, 3, TUSB_CLASS_SMART_CARD, 0, 0, 7,
+    9, TUSB_DESC_INTERFACE, 2, 0, 3, TUSB_CLASS_SMART_CARD, 0, 0, AUX_INTERFACE_STR_INDEX,
     0x36, 0x21, 0x10, 0x01, 0x00, 0x07, 0x02, 0x00, 0x00, 0x00,
     0xA0, 0x0F, 0x00, 0x00,
     0xA0, 0x0F, 0x00, 0x00,
@@ -349,66 +525,7 @@ static void usb_log_ccid_functional_descriptor(void)
 
 static bool ascii_to_hid(char c, uint8_t *modifier, uint8_t *keycode)
 {
-    *modifier = 0;
-    *keycode = 0;
-
-    if (c >= 'a' && c <= 'z') {
-        *keycode = HID_KEY_A + (uint8_t)(c - 'a');
-        return true;
-    }
-
-    if (c >= 'A' && c <= 'Z') {
-        *modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
-        *keycode = HID_KEY_A + (uint8_t)(c - 'A');
-        return true;
-    }
-
-    if (c >= '1' && c <= '9') {
-        *keycode = HID_KEY_1 + (uint8_t)(c - '1');
-        return true;
-    }
-
-    switch (c) {
-    case '0': *keycode = HID_KEY_0; return true;
-    case '\n': *keycode = HID_KEY_ENTER; return true;
-    case '\r': *keycode = HID_KEY_ENTER; return true;
-    case '\t': *keycode = HID_KEY_TAB; return true;
-    case ' ': *keycode = HID_KEY_SPACE; return true;
-    case '-': *keycode = HID_KEY_MINUS; return true;
-    case '_': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_MINUS; return true;
-    case '=': *keycode = HID_KEY_EQUAL; return true;
-    case '+': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_EQUAL; return true;
-    case '[': *keycode = HID_KEY_BRACKET_LEFT; return true;
-    case '{': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_BRACKET_LEFT; return true;
-    case ']': *keycode = HID_KEY_BRACKET_RIGHT; return true;
-    case '}': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_BRACKET_RIGHT; return true;
-    case '\\': *keycode = HID_KEY_BACKSLASH; return true;
-    case '|': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_BACKSLASH; return true;
-    case ';': *keycode = HID_KEY_SEMICOLON; return true;
-    case ':': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_SEMICOLON; return true;
-    case '\'': *keycode = HID_KEY_APOSTROPHE; return true;
-    case '"': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_APOSTROPHE; return true;
-    case '`': *keycode = HID_KEY_GRAVE; return true;
-    case '~': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_GRAVE; return true;
-    case ',': *keycode = HID_KEY_COMMA; return true;
-    case '<': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_COMMA; return true;
-    case '.': *keycode = HID_KEY_PERIOD; return true;
-    case '>': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_PERIOD; return true;
-    case '/': *keycode = HID_KEY_SLASH; return true;
-    case '?': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_SLASH; return true;
-    case '!': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_1; return true;
-    case '@': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_2; return true;
-    case '#': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_3; return true;
-    case '$': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_4; return true;
-    case '%': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_5; return true;
-    case '^': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_6; return true;
-    case '&': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_7; return true;
-    case '*': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_8; return true;
-    case '(': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_9; return true;
-    case ')': *modifier = KEYBOARD_MODIFIER_LEFTSHIFT; *keycode = HID_KEY_0; return true;
-    default:
-        return false;
-    }
+    return keyboard_layout_char(c, modifier, keycode);
 }
 
 static bool wait_for_keyboard_ready(uint32_t timeout_ms)
@@ -512,13 +629,34 @@ static void hid_task(void *arg)
             continue;
         }
 
+        if (msg.type == HID_MESSAGE_SYNC) {
+            xTaskNotifyGive(msg.waiter);
+            continue;
+        }
+
         if (!wait_for_mount()) {
             ESP_LOGW(TAG, "USB host not mounted; dropped HID text");
             continue;
         }
 
-        for (size_t i = 0; msg.text[i] != '\0'; i++) {
-            send_key(msg.text[i]);
+        if (msg.type == HID_MESSAGE_KEY_PRESS) {
+            uint8_t keycode[6] = {msg.key};
+            if (!send_keyboard_report(msg.modifier, keycode)) {
+                ESP_LOGW(TAG, "Failed to send HID key press: 0x%02x", msg.key);
+            }
+            vTaskDelay(pdMS_TO_TICKS(HID_REPORT_INTERVAL_MS));
+        } else if (msg.type == HID_MESSAGE_KEY_RELEASE) {
+            uint8_t keycode[6] = {0};
+            if (!send_keyboard_report(0, keycode)) {
+                ESP_LOGW(TAG, "Failed to send HID key release");
+            }
+            vTaskDelay(pdMS_TO_TICKS(HID_REPORT_INTERVAL_MS));
+        } else if (msg.type == HID_MESSAGE_DELAY) {
+            vTaskDelay(pdMS_TO_TICKS(msg.delay_ms));
+        } else {
+            for (size_t i = 0; msg.text[i] != '\0'; i++) {
+                send_key(msg.text[i]);
+            }
         }
     }
 }
@@ -576,8 +714,53 @@ static esp_err_t ensure_nvs_ready(void)
     return ret;
 }
 
+uint16_t usb_hid_get_vid(void)
+{
+    uint16_t vid = USB_VID_DEFAULT;
+    if (ensure_nvs_ready() != ESP_OK) {
+        return vid;
+    }
+
+    nvs_handle_t nvs;
+    if (nvs_open(CONNECT_SETTINGS_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return vid;
+    }
+
+    esp_err_t ret = nvs_get_u16(nvs, CONNECT_USB_VID_NVS_KEY, &vid);
+    nvs_close(nvs);
+    if (ret != ESP_OK || vid < USB_VID_MIN || vid > USB_VID_MAX) {
+        return USB_VID_DEFAULT;
+    }
+    return vid;
+}
+
+esp_err_t usb_hid_set_vid(uint16_t vid)
+{
+    if (vid < USB_VID_MIN || vid > USB_VID_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(ensure_nvs_ready(), TAG, "Failed to init NVS");
+
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open(CONNECT_SETTINGS_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to open USB VID NVS");
+
+    ret = nvs_set_u16(nvs, CONNECT_USB_VID_NVS_KEY, vid);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+
+    if (ret == ESP_OK) {
+        s_usb_active_device_descriptor.idVendor = vid;
+    }
+    return ret;
+}
+
 static esp_err_t erase_and_format_usbstore(void)
 {
+    log_storage_pause();
     esp_err_t ret = tinyusb_msc_set_storage_mount_point(s_msc_storage, TINYUSB_MSC_STORAGE_MOUNT_APP);
     if (ret != ESP_OK) {
         return ret;
@@ -586,15 +769,42 @@ static esp_err_t erase_and_format_usbstore(void)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     size_t wl_bytes = wl_size(s_msc_wl_handle);
-    if (wl_bytes == 0) {
-        ESP_LOGW(TAG, "Invalid usbstore WL size");
+    size_t wl_sector_bytes = wl_sector_size(s_msc_wl_handle);
+    if (wl_bytes == 0 || wl_sector_bytes == 0 || (wl_bytes % wl_sector_bytes) != 0) {
+        ESP_LOGW(TAG, "Invalid usbstore WL geometry: size=%u sector=%u",
+                 (unsigned int)wl_bytes,
+                 (unsigned int)wl_sector_bytes);
         return ESP_ERR_INVALID_SIZE;
     }
 
-    ret = wl_erase_range(s_msc_wl_handle, 0, wl_bytes);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to erase usbstore WL area: %s", esp_err_to_name(ret));
-        return ret;
+    const size_t erase_chunk_bytes = wl_sector_bytes * MSC_ERASE_CHUNK_SECTORS;
+    size_t next_log_bytes = MSC_ERASE_LOG_BYTES;
+    ESP_LOGI(TAG, "Erase usbstore in chunks: total=%u sector=%u chunk=%u",
+             (unsigned int)wl_bytes,
+             (unsigned int)wl_sector_bytes,
+             (unsigned int)erase_chunk_bytes);
+
+    for (size_t offset = 0; offset < wl_bytes;) {
+        size_t remaining = wl_bytes - offset;
+        size_t current_chunk_bytes = remaining < erase_chunk_bytes ? remaining : erase_chunk_bytes;
+        ret = wl_erase_range(s_msc_wl_handle, offset, current_chunk_bytes);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to erase usbstore WL area at offset=%u size=%u: %s",
+                     (unsigned int)offset,
+                     (unsigned int)current_chunk_bytes,
+                     esp_err_to_name(ret));
+            return ret;
+        }
+
+        offset += current_chunk_bytes;
+        if (offset >= next_log_bytes || offset == wl_bytes) {
+            ESP_LOGI(TAG, "usbstore erase progress: %u/%u bytes",
+                     (unsigned int)offset,
+                     (unsigned int)wl_bytes);
+            next_log_bytes += MSC_ERASE_LOG_BYTES;
+        }
+
+        vTaskDelay(1);
     }
 
     s_msc_fat_partition_number = 0;
@@ -606,6 +816,71 @@ static esp_err_t erase_and_format_usbstore(void)
 
     ESP_LOGI(TAG, "usbstore erase and format complete");
     return ESP_OK;
+}
+
+static esp_err_t format_usbstore_filesystem(void)
+{
+    log_storage_pause();
+    esp_err_t ret = tinyusb_msc_set_storage_mount_point(s_msc_storage, TINYUSB_MSC_STORAGE_MOUNT_APP);
+    if (ret != ESP_OK) {
+        log_storage_resume();
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+    s_msc_fat_partition_number = 0;
+    ret = tinyusb_msc_format_storage(s_msc_storage);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to format usbstore filesystem: %s", esp_err_to_name(ret));
+        log_storage_resume();
+        return ret;
+    }
+
+    log_storage_resume();
+    ESP_LOGI(TAG, "usbstore filesystem format complete");
+    return ESP_OK;
+}
+
+esp_err_t usb_msc_factory_format(void)
+{
+    if (!s_msc_storage || s_msc_wl_handle == WL_INVALID_HANDLE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return erase_and_format_usbstore();
+}
+
+esp_err_t usb_msc_mark_storage_initialized(void)
+{
+    ESP_RETURN_ON_ERROR(ensure_nvs_ready(), TAG, "Failed to init NVS");
+
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open(MSC_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to open usbstore NVS");
+    ret = nvs_set_u8(nvs, MSC_NVS_FORMAT_KEY, 1);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return ret;
+}
+
+static void load_hid_keyboard_layout(void)
+{
+    if (ensure_nvs_ready() != ESP_OK) {
+        return;
+    }
+
+    nvs_handle_t nvs;
+    if (nvs_open(CONNECT_SETTINGS_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+
+    uint8_t selected = HID_LAYOUT_US;
+    if (nvs_get_u8(nvs, CONNECT_HID_LAYOUT_NVS_KEY, &selected) == ESP_OK &&
+        selected < HID_LAYOUT_COUNT) {
+        keyboard_layout_set((hid_keyboard_layout_t)selected);
+    }
+    nvs_close(nvs);
 }
 
 static esp_err_t format_usbstore_on_first_boot(void)
@@ -630,8 +905,8 @@ static esp_err_t format_usbstore_on_first_boot(void)
         return ret;
     }
 
-    ESP_LOGW(TAG, "First boot: erase and format usbstore flash disk");
-    ret = erase_and_format_usbstore();
+    ESP_LOGW(TAG, "First boot: format usbstore filesystem");
+    ret = format_usbstore_filesystem();
     if (ret != ESP_OK) {
         nvs_close(nvs);
         return ret;
@@ -670,6 +945,20 @@ esp_err_t usb_msc_storage_init(void)
 
     ESP_RETURN_ON_ERROR(wl_mount(storage_partition, &s_msc_wl_handle), TAG, "Failed to mount wear levelling");
 
+    const tinyusb_msc_driver_config_t driver_cfg = {
+        .user_flags = {
+            .auto_mount_off = 1,
+        },
+        .callback = msc_event_handler,
+        .callback_arg = NULL,
+    };
+    esp_err_t ret = tinyusb_msc_install_driver(&driver_cfg);
+    if (ret != ESP_OK) {
+        wl_unmount(s_msc_wl_handle);
+        s_msc_wl_handle = WL_INVALID_HANDLE;
+        return ret;
+    }
+
     tinyusb_msc_storage_config_t storage_cfg = {
         .medium.wl_handle = s_msc_wl_handle,
         .mount_point = TINYUSB_MSC_STORAGE_MOUNT_APP,
@@ -685,18 +974,15 @@ esp_err_t usb_msc_storage_init(void)
         },
     };
 
-    esp_err_t ret = tinyusb_msc_new_storage_spiflash(&storage_cfg, &s_msc_storage);
+    ret = tinyusb_msc_new_storage_spiflash(&storage_cfg, &s_msc_storage);
     if (ret != ESP_OK) {
+        (void)tinyusb_msc_uninstall_driver();
         if (s_msc_wl_handle != WL_INVALID_HANDLE) {
             wl_unmount(s_msc_wl_handle);
             s_msc_wl_handle = WL_INVALID_HANDLE;
         }
         return ret;
     }
-
-    ESP_RETURN_ON_ERROR(tinyusb_msc_set_storage_callback(msc_event_handler, NULL),
-                        TAG,
-                        "Failed to set MSC callback");
     ESP_RETURN_ON_ERROR(format_usbstore_on_first_boot(), TAG, "Failed first-boot usbstore format");
 
     ESP_LOGI(TAG, "MSC flash storage mounted to APP; use switch_usbstore to expose USB disk");
@@ -790,9 +1076,13 @@ static esp_err_t set_storage_mount_point_wait(tinyusb_msc_mount_point_t mount_po
     }
 
     if (current_mount_point == mount_point) {
+        if (mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP) {
+            log_storage_resume();
+        }
         return ESP_OK;
     }
 
+    log_storage_pause();
     const EventBits_t done_bit = mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP ? MSC_MOUNT_APP_DONE_BIT : MSC_MOUNT_USB_DONE_BIT;
     xEventGroupClearBits(s_msc_event_group, MSC_MOUNT_APP_DONE_BIT | MSC_MOUNT_USB_DONE_BIT | MSC_MOUNT_FAILED_BIT);
 
@@ -807,6 +1097,9 @@ static esp_err_t set_storage_mount_point_wait(tinyusb_msc_mount_point_t mount_po
                                            pdFALSE,
                                            pdMS_TO_TICKS(MSC_MOUNT_TIMEOUT_MS));
     if ((bits & done_bit) != 0) {
+        if (mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP) {
+            log_storage_resume();
+        }
         return ESP_OK;
     }
 
@@ -853,13 +1146,23 @@ static esp_err_t install_tinyusb_driver(usb_mode_t mode)
 #else
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG(tinyusb_event_handler);
 #endif
-    tusb_cfg.descriptor.device = &s_usb_device_descriptor;
+    const tusb_desc_device_t *device_descriptor_template;
     switch (mode) {
+    case USB_MODE_HID_JADE_CDC:
+        device_descriptor_template = &s_usb_jade_device_descriptor;
+        tusb_cfg.descriptor.full_speed_config = s_usb_configuration_descriptor_hid_jade_fs;
+        break;
+    case USB_MODE_HID_NCM:
+        device_descriptor_template = &s_usb_ncm_device_descriptor;
+        tusb_cfg.descriptor.full_speed_config = s_usb_configuration_descriptor_hid_ncm_fs;
+        break;
     case USB_MODE_HID_CCID:
+        device_descriptor_template = &s_usb_ccid_device_descriptor;
         tusb_cfg.descriptor.full_speed_config = s_usb_configuration_descriptor_ccid_fs;
         break;
     case USB_MODE_HID_MSC:
 #if USB_MSC_DEFAULT_ENABLED
+        device_descriptor_template = &s_usb_msc_device_descriptor;
         tusb_cfg.descriptor.full_speed_config = s_usb_configuration_descriptor_msc_fs;
         break;
 #else
@@ -867,14 +1170,26 @@ static esp_err_t install_tinyusb_driver(usb_mode_t mode)
 #endif
     case USB_MODE_HID_ONLY:
     default:
+        device_descriptor_template = &s_usb_hid_device_descriptor;
         tusb_cfg.descriptor.full_speed_config = s_usb_configuration_descriptor_hid_fs;
         break;
     }
+    s_usb_active_device_descriptor = *device_descriptor_template;
+    s_usb_active_device_descriptor.idVendor = usb_hid_get_vid();
+    tusb_cfg.descriptor.device = &s_usb_active_device_descriptor;
     tusb_cfg.descriptor.string = s_hid_string_descriptor;
     tusb_cfg.descriptor.string_count = sizeof(s_hid_string_descriptor) / sizeof(s_hid_string_descriptor[0]);
 #if (TUD_OPT_HIGH_SPEED)
-    tusb_cfg.descriptor.qualifier = &s_usb_device_qualifier;
+    tusb_cfg.descriptor.qualifier = mode == USB_MODE_HID_NCM
+                                        ? &s_usb_ncm_device_qualifier
+                                        : &s_usb_device_qualifier;
     switch (mode) {
+    case USB_MODE_HID_JADE_CDC:
+        tusb_cfg.descriptor.high_speed_config = s_usb_configuration_descriptor_hid_jade_hs;
+        break;
+    case USB_MODE_HID_NCM:
+        tusb_cfg.descriptor.high_speed_config = s_usb_configuration_descriptor_hid_ncm_hs;
+        break;
     case USB_MODE_HID_CCID:
         tusb_cfg.descriptor.high_speed_config = s_usb_configuration_descriptor_ccid_hs;
         break;
@@ -897,8 +1212,10 @@ static esp_err_t install_tinyusb_driver(usb_mode_t mode)
         usb_log_ccid_functional_descriptor();
     }
     canokey_esp32p4_ctaphid_usb_init();
-    ESP_LOGI(TAG, "TinyUSB driver installed: mode=%d mounted=%u hid0_ready=%u ctaphid_ready=%u",
+    ESP_LOGI(TAG, "TinyUSB driver installed: mode=%d VID=%04X PID=%04X mounted=%u hid0_ready=%u ctaphid_ready=%u",
              (int)mode,
+             s_usb_active_device_descriptor.idVendor,
+             s_usb_active_device_descriptor.idProduct,
              tud_mounted() ? 1 : 0,
              tud_hid_n_ready(HID_ITF_NUM_KEYBOARD) ? 1 : 0,
              tud_hid_n_ready(HID_ITF_NUM_CTAPHID) ? 1 : 0);
@@ -908,20 +1225,29 @@ static esp_err_t install_tinyusb_driver(usb_mode_t mode)
 
 static esp_err_t reinstall_tinyusb_driver(usb_mode_t mode)
 {
-    if (s_usb_mode == mode) {
+    if (s_usb_mode == mode && tusb_inited()) {
         return ESP_OK;
     }
 
+    ESP_LOGI(TAG, "Switching TinyUSB mode %d -> %d", (int)s_usb_mode, (int)mode);
     if (tusb_inited()) {
         (void)tud_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(120));
-        ESP_RETURN_ON_ERROR(tinyusb_driver_uninstall(), TAG, "TinyUSB uninstall failed");
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(USB_DISCONNECT_DELAY_MS));
+        esp_err_t ret = tinyusb_driver_uninstall();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "TinyUSB uninstall failed: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        vTaskDelay(pdMS_TO_TICKS(USB_REINSTALL_DELAY_MS));
     }
 
-    ESP_RETURN_ON_ERROR(install_tinyusb_driver(mode), TAG, "TinyUSB reinstall failed");
+    esp_err_t ret = install_tinyusb_driver(mode);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "TinyUSB mode %d install failed: %s", (int)mode, esp_err_to_name(ret));
+        return ret;
+    }
     (void)tud_connect();
-    vTaskDelay(pdMS_TO_TICKS(120));
+    vTaskDelay(pdMS_TO_TICKS(USB_ENUM_SETTLE_MS));
     return ESP_OK;
 }
 
@@ -931,15 +1257,21 @@ esp_err_t usb_hid_keyboard_init(void)
         return ESP_OK;
     }
 
-    s_hid_queue = xQueueCreate(HID_QUEUE_DEPTH, sizeof(hid_text_msg_t));
-    ESP_RETURN_ON_FALSE(s_hid_queue, ESP_ERR_NO_MEM, TAG, "Failed to create HID queue");
+    load_hid_keyboard_layout();
+
+    if (!s_hid_queue) {
+        s_hid_queue = xQueueCreate(HID_QUEUE_DEPTH, sizeof(hid_text_msg_t));
+        ESP_RETURN_ON_FALSE(s_hid_queue, ESP_ERR_NO_MEM, TAG, "Failed to create HID queue");
+    }
 #if USB_MSC_DEFAULT_ENABLED
     ESP_LOGI(TAG, "USB MSC descriptor enabled; storage init is handled separately");
 #else
     ESP_LOGI(TAG, "USB MSC disk mode disabled by default");
 #endif
 
-    ESP_RETURN_ON_ERROR(install_tinyusb_driver(USB_MODE_HID_ONLY), TAG, "TinyUSB init failed");
+    if (!tusb_inited()) {
+        ESP_RETURN_ON_ERROR(install_tinyusb_driver(USB_MODE_HID_ONLY), TAG, "TinyUSB init failed");
+    }
     ESP_RETURN_ON_FALSE(xTaskCreate(hid_task, "usb_hid", HID_TASK_STACK_SIZE, NULL, HID_TASK_PRIORITY, NULL) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "Failed to create HID task");
 
@@ -960,11 +1292,16 @@ esp_err_t usb_hid_enable_smartcard_reader(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (s_ncm_enabled) {
+        ESP_RETURN_ON_ERROR(usb_hid_disable_ncm(), TAG, "disable NCM before smartcard failed");
+    }
+    ESP_RETURN_ON_FALSE(!s_jade_cdc_enabled, ESP_ERR_INVALID_STATE, TAG,
+                        "disable Jade protocol before smartcard");
+
     if (s_usbstore_exposed_to_usb) {
-        esp_err_t ret = usbstore_set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_APP);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to close usbstore before smartcard: %s", esp_err_to_name(ret));
-        }
+        ESP_RETURN_ON_ERROR(usb_hid_disable_usbstore(),
+                            TAG,
+                            "disable usbstore before smartcard failed");
     }
 
     s_smartcard_reader_enabled = true;
@@ -998,17 +1335,35 @@ esp_err_t usb_hid_enable_usbstore(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (s_ncm_enabled) {
+        ESP_RETURN_ON_ERROR(usb_hid_disable_ncm(), TAG, "disable NCM before usbstore failed");
+    }
+    ESP_RETURN_ON_FALSE(!s_jade_cdc_enabled, ESP_ERR_INVALID_STATE, TAG,
+                        "disable Jade protocol before usbstore");
+
     if (s_smartcard_reader_enabled) {
         usb_ccid_deactivate_card();
         s_smartcard_reader_enabled = false;
     }
 
-    ESP_RETURN_ON_ERROR(reinstall_tinyusb_driver(USB_MODE_HID_MSC), TAG, "TinyUSB usbstore mode failed");
-    esp_err_t ret = usbstore_set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_USB);
-    if (ret == ESP_OK) {
-        s_usbstore_exposed_to_usb = true;
+    esp_err_t ret = reinstall_tinyusb_driver(USB_MODE_HID_MSC);
+    if (ret != ESP_OK) {
+        return ret;
     }
-    return ret;
+
+    ret = usbstore_set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_USB);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to release usbstore from APP: %s", esp_err_to_name(ret));
+        esp_err_t restore_ret = reinstall_tinyusb_driver(USB_MODE_HID_ONLY);
+        if (restore_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restore HID-only mode: %s",
+                     esp_err_to_name(restore_ret));
+        }
+        return ret;
+    }
+
+    s_usbstore_exposed_to_usb = true;
+    return ESP_OK;
 }
 
 esp_err_t usb_hid_disable_usbstore(void)
@@ -1017,11 +1372,14 @@ esp_err_t usb_hid_disable_usbstore(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t ret = usbstore_set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_APP);
+    esp_err_t ret = reinstall_tinyusb_driver(USB_MODE_HID_ONLY);
     if (ret != ESP_OK) {
         return ret;
     }
-    ESP_RETURN_ON_ERROR(reinstall_tinyusb_driver(USB_MODE_HID_ONLY), TAG, "TinyUSB HID-only mode failed");
+
+    ESP_RETURN_ON_ERROR(usbstore_set_mount_point(TINYUSB_MSC_STORAGE_MOUNT_APP),
+                        TAG,
+                        "mount usbstore to APP failed");
     s_usbstore_exposed_to_usb = false;
     return ESP_OK;
 }
@@ -1040,6 +1398,129 @@ bool usb_hid_usbstore_is_exposed_to_usb(void)
     return s_usbstore_exposed_to_usb;
 }
 
+esp_err_t usb_hid_enable_ncm(void)
+{
+    if (!s_hid_started) {
+        ESP_LOGW(TAG, "USB HID was not started; retrying FIDO initialization before NCM");
+        ESP_RETURN_ON_ERROR(usb_hid_keyboard_init(), TAG, "FIDO recovery init failed");
+    }
+    if (s_ncm_enabled) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_FALSE(!s_jade_cdc_enabled, ESP_ERR_INVALID_STATE, TAG,
+                        "disable Jade protocol before NCM");
+    if (s_usbstore_exposed_to_usb) {
+        ESP_RETURN_ON_ERROR(usb_hid_disable_usbstore(),
+                            TAG,
+                            "disable usbstore before NCM failed");
+    }
+
+    ESP_RETURN_ON_ERROR(usb_ncm_init(), TAG, "NCM network init failed");
+    esp_err_t ret = reinstall_tinyusb_driver(USB_MODE_HID_NCM);
+    if (ret != ESP_OK) {
+        usb_ncm_deinit();
+        esp_err_t restore_ret = reinstall_tinyusb_driver(USB_MODE_HID_ONLY);
+        if (restore_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restore FIDO after NCM error: %s",
+                     esp_err_to_name(restore_ret));
+        }
+        return ret;
+    }
+
+    s_ncm_enabled = true;
+    ESP_LOGI(TAG, "USB FIDO+NCM mode enabled");
+    return ESP_OK;
+}
+
+esp_err_t usb_hid_disable_ncm(void)
+{
+    if (!s_hid_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_ncm_enabled) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = reinstall_tinyusb_driver(USB_MODE_HID_ONLY);
+    if (ret != ESP_OK) {
+        esp_err_t restore_ret = reinstall_tinyusb_driver(USB_MODE_HID_NCM);
+        if (restore_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to restore NCM mode after FIDO error: %s",
+                     esp_err_to_name(restore_ret));
+        }
+        return ret;
+    }
+    s_ncm_enabled = false;
+    usb_ncm_deinit();
+    ESP_LOGI(TAG, "USB NCM disabled; FIDO-only PID restored");
+    return ESP_OK;
+}
+
+bool usb_hid_ncm_is_enabled(void)
+{
+    return s_ncm_enabled;
+}
+
+esp_err_t usb_hid_enable_jade(void)
+{
+    if (!s_hid_started) {
+        ESP_RETURN_ON_ERROR(usb_hid_keyboard_init(), TAG, "USB HID init before Jade failed");
+    }
+    if (s_jade_cdc_enabled) {
+        return ESP_OK;
+    }
+    if (s_ncm_enabled) {
+        ESP_RETURN_ON_ERROR(usb_hid_disable_ncm(), TAG, "disable NCM before Jade failed");
+    }
+    if (s_usbstore_exposed_to_usb) {
+        ESP_RETURN_ON_ERROR(usb_hid_disable_usbstore(), TAG, "disable usbstore before Jade failed");
+    }
+    if (s_smartcard_reader_enabled) {
+        ESP_RETURN_ON_ERROR(usb_hid_disable_smartcard_reader(), TAG,
+                            "disable smartcard before Jade failed");
+    }
+
+    ESP_RETURN_ON_ERROR(reinstall_tinyusb_driver(USB_MODE_HID_JADE_CDC), TAG,
+                        "TinyUSB Jade CDC mode failed");
+    s_jade_cdc_enabled = true;
+    ESP_LOGI(TAG, "USB FIDO+Jade CDC mode enabled");
+    return ESP_OK;
+}
+
+esp_err_t usb_hid_disable_jade(void)
+{
+    if (!s_hid_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_jade_cdc_enabled) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(reinstall_tinyusb_driver(USB_MODE_HID_ONLY), TAG,
+                        "TinyUSB HID-only mode failed");
+    s_jade_cdc_enabled = false;
+    ESP_LOGI(TAG, "USB Jade CDC disabled; FIDO-only PID restored");
+    return ESP_OK;
+}
+
+bool usb_hid_jade_is_enabled(void)
+{
+    return s_jade_cdc_enabled;
+}
+
+esp_err_t usb_hid_keyboard_set_layout(hid_keyboard_layout_t layout)
+{
+    if ((unsigned int)layout >= HID_LAYOUT_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    keyboard_layout_set(layout);
+    return ESP_OK;
+}
+
+hid_keyboard_layout_t usb_hid_keyboard_get_layout(void)
+{
+    return keyboard_layout_get();
+}
+
 esp_err_t usb_hid_keyboard_type_text(const char *text)
 {
     if (!s_hid_started || !s_hid_queue) {
@@ -1050,13 +1531,79 @@ esp_err_t usb_hid_keyboard_type_text(const char *text)
         return ESP_ERR_INVALID_ARG;
     }
 
-    hid_text_msg_t msg = {0};
+    hid_text_msg_t msg = {
+        .type = HID_MESSAGE_TEXT,
+    };
     strlcpy(msg.text, text, sizeof(msg.text));
 
     if (xQueueSend(s_hid_queue, &msg, 0) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
 
+    return ESP_OK;
+}
+
+esp_err_t usb_hid_keyboard_key_press(uint8_t key)
+{
+    return usb_hid_keyboard_report_press(0, key);
+}
+
+esp_err_t usb_hid_keyboard_report_press(uint8_t modifier, uint8_t key)
+{
+    if (!s_hid_started || !s_hid_queue) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (key == 0 && modifier == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    hid_text_msg_t msg = {
+        .type = HID_MESSAGE_KEY_PRESS,
+        .key = key,
+        .modifier = modifier,
+    };
+    return xQueueSend(s_hid_queue, &msg, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t usb_hid_keyboard_key_release(void)
+{
+    if (!s_hid_started || !s_hid_queue) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    hid_text_msg_t msg = {
+        .type = HID_MESSAGE_KEY_RELEASE,
+    };
+    return xQueueSend(s_hid_queue, &msg, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t usb_hid_keyboard_delay(uint32_t delay_ms)
+{
+    if (!s_hid_started || !s_hid_queue) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    hid_text_msg_t msg = {
+        .type = HID_MESSAGE_DELAY,
+        .delay_ms = delay_ms,
+    };
+    return xQueueSend(s_hid_queue, &msg, 0) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+esp_err_t usb_hid_keyboard_wait_idle(void)
+{
+    if (!s_hid_started || !s_hid_queue) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    hid_text_msg_t msg = {
+        .type = HID_MESSAGE_SYNC,
+        .waiter = xTaskGetCurrentTaskHandle(),
+    };
+    if (xQueueSend(s_hid_queue, &msg, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     return ESP_OK;
 }
 
@@ -1311,19 +1858,15 @@ static esp_err_t check_usbstore_config(void)
 
 esp_err_t usb_hid_mount_usbstore_app(void)
 {
-    esp_err_t ret = check_usbstore_config();
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
     if (usbstore_app_path_ready()) {
+        log_storage_resume();
         ESP_LOGI(TAG, "usbstore already mounted to APP: %s", MSC_MOUNT_BASE_PATH);
         return ESP_OK;
     }
 
     int first_errno = errno;
     tinyusb_msc_mount_point_t current_mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB;
-    ret = tinyusb_msc_get_storage_mount_point(s_msc_storage, &current_mount_point);
+    esp_err_t ret = tinyusb_msc_get_storage_mount_point(s_msc_storage, &current_mount_point);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to get usbstore mount point before APP mount: %s", esp_err_to_name(ret));
         return ret;
@@ -1334,6 +1877,27 @@ esp_err_t usb_hid_mount_usbstore_app(void)
              first_errno,
              current_mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB ? "USB" : "APP");
 
+    if (current_mount_point == TINYUSB_MSC_STORAGE_MOUNT_USB) {
+        ESP_LOGI(TAG, "Detach USB MSC before mounting usbstore to APP");
+        ret = usb_hid_disable_usbstore();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to detach USB MSC before APP mount: %s",
+                     esp_err_to_name(ret));
+            return ret;
+        }
+        if (usbstore_app_path_ready()) {
+            log_storage_resume();
+            ESP_LOGI(TAG, "usbstore APP mount verified after USB MSC detach: %s",
+                     MSC_MOUNT_BASE_PATH);
+            return ESP_OK;
+        }
+    }
+
+    ret = check_usbstore_config();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
     if (s_msc_fat_partition_number != 0) {
         ESP_LOGW(TAG, "usbstore uses MBR partition layout; reformat to ESP FatFs layout");
         ret = erase_and_format_usbstore();
@@ -1342,6 +1906,7 @@ esp_err_t usb_hid_mount_usbstore_app(void)
         }
 
         if (usbstore_app_path_ready()) {
+            log_storage_resume();
             ESP_LOGI(TAG, "usbstore APP mount verified after format: %s", MSC_MOUNT_BASE_PATH);
             return ESP_OK;
         }
@@ -1413,6 +1978,9 @@ static esp_err_t usbstore_set_mount_point(tinyusb_msc_mount_point_t mount_point)
     }
 
     if (current_mount_point == mount_point) {
+        if (mount_point == TINYUSB_MSC_STORAGE_MOUNT_APP) {
+            log_storage_resume();
+        }
         return ESP_OK;
     }
 

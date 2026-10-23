@@ -1,21 +1,39 @@
 #include "applets.h"
 #include "apdu.h"
 #include "canokey_esp32p4.h"
+#include "canokey_nfc.h"
+#include "canokey_port_internal.h"
 #include "device.h"
+#include "ctaphid.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "fs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <stdatomic.h>
 
 static TaskHandle_t s_canokey_task_handle;
-static bool s_canokey_ready;
+static atomic_bool s_canokey_ready;
 static bool s_ccid_session_active;
+static SemaphoreHandle_t s_core_mutex;
 
 static const char *TAG = "canokey_port";
 
-#define CTAP_CERT_FILE_NAME   "ctap_cert"
-#define CTAP_PRIVATE_KEY_ATTR 0x00
+bool canokey_port_core_lock(uint32_t timeout_ms)
+{
+    return s_core_mutex && xSemaphoreTakeRecursive(s_core_mutex, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void canokey_port_core_unlock(void)
+{
+    xSemaphoreGiveRecursive(s_core_mutex);
+}
+
+bool canokey_port_ccid_session_active(void)
+{
+    return s_ccid_session_active;
+}
 
 int canokey_esp32p4_process_ccid_apdu(const uint8_t *command, uint16_t command_len,
                                       uint8_t *response, uint16_t response_size,
@@ -29,54 +47,6 @@ static void ccid_session_keepalive_poll(void)
     if (s_ccid_session_active) {
         device_applet_session_touch(DEVICE_APPLET_SESSION_CCID);
     }
-}
-
-static esp_err_t ensure_test_attestation_installed(void)
-{
-    static const uint8_t fido_private_key[32] = {
-        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-    };
-    static const uint8_t cert[] = {
-        0x30, 0x03, 0x02, 0x01, 0x01,
-    };
-
-    uint8_t key[sizeof(fido_private_key)] = {0};
-    int key_len = read_attr(CTAP_CERT_FILE_NAME,
-                            CTAP_PRIVATE_KEY_ATTR,
-                            key,
-                            sizeof(key));
-    int cert_len = get_file_size(CTAP_CERT_FILE_NAME);
-
-    if (key_len == (int)sizeof(fido_private_key) && cert_len > 0) {
-        ESP_LOGI(TAG, "CTAP attestation already installed: key_len=%d cert_len=%d", key_len, cert_len);
-        return ESP_OK;
-    }
-
-    ESP_LOGW(TAG,
-             "CTAP attestation missing/incomplete: key_len=%d cert_len=%d; installing test attestation",
-             key_len,
-             cert_len);
-
-    int ret = write_file(CTAP_CERT_FILE_NAME, cert, 0, sizeof(cert), 1);
-    if (ret != 0) {
-        ESP_LOGE(TAG, "write test attestation certificate failed: %d", ret);
-        return ESP_FAIL;
-    }
-
-    ret = write_attr(CTAP_CERT_FILE_NAME,
-                     CTAP_PRIVATE_KEY_ATTR,
-                     fido_private_key,
-                     sizeof(fido_private_key));
-    if (ret != 0) {
-        ESP_LOGE(TAG, "write test attestation private key failed: %d", ret);
-        return ESP_FAIL;
-    }
-
-    ESP_LOGW(TAG, "CTAP test attestation installed");
-    return ESP_OK;
 }
 
 int device_spinlock_lock(volatile uint32_t *lock, uint32_t blocking)
@@ -150,21 +120,24 @@ static void canokey_task(void *arg)
     }
     ESP_LOGI(TAG, "CanoKey applets_install done");
 
-    if (ensure_test_attestation_installed() != ESP_OK) {
-        ESP_LOGE(TAG, "CanoKey task stopped: CTAP attestation unavailable");
-        s_canokey_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
     s_canokey_ready = true;
     ESP_LOGI(TAG, "CanoKey task ready; entering device loop");
     while (true) {
         ESP_LOGD(TAG, "CanoKey device_loop begin");
         /* Keep the host-owned CCID session alive before device_loop() checks
          * the 2-second CanoKey applet timeout. */
-        ccid_session_keepalive_poll();
-        device_loop();
+        if (canokey_port_core_lock(0)) {
+            ccid_session_keepalive_poll();
+            canokey_nfc_loop();
+            if (canokey_nfc_is_active()) {
+                /* Skip session expiry while the RF field owns the card. The
+                 * wrapper drains USB reports without dispatching HID work. */
+                CTAPHID_Loop(0);
+            } else {
+                device_loop();
+            }
+            canokey_port_core_unlock();
+        }
         ESP_LOGD(TAG, "CanoKey device_loop done");
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -174,6 +147,11 @@ esp_err_t canokey_esp32p4_start(void)
 {
     if (s_canokey_task_handle) {
         return ESP_OK;
+    }
+
+    if (!s_core_mutex) {
+        s_core_mutex = xSemaphoreCreateRecursiveMutex();
+        if (!s_core_mutex) return ESP_ERR_NO_MEM;
     }
 
     BaseType_t ok = xTaskCreate(canokey_task,
@@ -202,6 +180,11 @@ bool canokey_esp32p4_is_ready(void)
 
 esp_err_t canokey_esp32p4_openpgp_probe(void)
 {
+    if (!canokey_esp32p4_is_ready() || !canokey_port_core_lock(1000)) return ESP_ERR_INVALID_STATE;
+    if (canokey_nfc_is_active()) {
+        canokey_port_core_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
     static const uint8_t select_openpgp[] = {
         0x00, 0xA4, 0x04, 0x00, 0x06, 0xD2, 0x76, 0x00, 0x01, 0x24, 0x01,
     };
@@ -224,11 +207,13 @@ esp_err_t canokey_esp32p4_openpgp_probe(void)
      * it here so the real session starts cleanly at IccPowerOn. */
     device_applet_session_release(DEVICE_APPLET_SESSION_CCID);
     s_ccid_session_active = false;
+    canokey_port_core_unlock();
     return ret == 0 && status_word == SW_NO_ERROR ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t canokey_esp32p4_ccid_power_on(void)
+static esp_err_t ccid_power_on_locked(void)
 {
+    if (canokey_nfc_is_active()) return ESP_ERR_INVALID_STATE;
     if (!canokey_esp32p4_is_ready()) {
         ESP_LOGW(TAG, "CCID power-on rejected: CanoKey task is not ready");
         return ESP_ERR_INVALID_STATE;
@@ -258,7 +243,7 @@ esp_err_t canokey_esp32p4_ccid_power_on(void)
     return ESP_OK;
 }
 
-void canokey_esp32p4_ccid_power_off(void)
+static void ccid_power_off_locked(void)
 {
     /* CCID PowerOff/USB reset is the only place we intentionally drop volatile
      * OpenPGP state such as PW1/PW3 validation and import chaining. */
@@ -267,11 +252,11 @@ void canokey_esp32p4_ccid_power_off(void)
     ESP_LOGI(TAG, "CCID applet session released");
 }
 
-int canokey_esp32p4_process_ccid_apdu(const uint8_t *command, uint16_t command_len,
+static int process_ccid_apdu_locked(const uint8_t *command, uint16_t command_len,
                                       uint8_t *response, uint16_t response_size,
                                       uint16_t *response_len, uint16_t *status_word)
 {
-    if (!command || !response || !response_len || !status_word || !canokey_esp32p4_is_running()) {
+    if (!command || !response || !response_len || !status_word || !canokey_esp32p4_is_ready() || canokey_nfc_is_active()) {
         ESP_LOGW(TAG, "CCID APDU rejected: command=%p response=%p response_len=%p status_word=%p running=%u ready=%u",
                  command,
                  response,
@@ -282,8 +267,9 @@ int canokey_esp32p4_process_ccid_apdu(const uint8_t *command, uint16_t command_l
         return -1;
     }
     uint8_t command_data[APDU_INCOMING_DATA_SIZE] = {0};
+    uint8_t response_data[APDU_COMMAND_BUFFER_SIZE];
     CAPDU capdu = {.data = command_data};
-    RAPDU rapdu = {.data = response};
+    RAPDU rapdu = {.data = response_data};
     if (build_capdu(&capdu, command, command_len) < 0) {
         ESP_LOGW(TAG, "CCID APDU parse failed: len=%u", command_len);
         return -2;
@@ -291,7 +277,7 @@ int canokey_esp32p4_process_ccid_apdu(const uint8_t *command, uint16_t command_l
     /* Each APDU only needs exclusive access to the shared APDU buffer. The
      * applet session itself is held from IccPowerOn to IccPowerOff so OpenPGP
      * keeps PW3/PW1 validation between commands. */
-    if (!s_ccid_session_active && canokey_esp32p4_ccid_power_on() != ESP_OK) {
+    if (!s_ccid_session_active && ccid_power_on_locked() != ESP_OK) {
         return -4;
     }
     if (device_applet_session_acquire(DEVICE_APPLET_SESSION_CCID) != 0) {
@@ -321,6 +307,34 @@ int canokey_esp32p4_process_ccid_apdu(const uint8_t *command, uint16_t command_l
     }
     *response_len = rapdu.len;
     *status_word = rapdu.sw;
+    memcpy(response, response_data, rapdu.len);
     ESP_LOGI(TAG, "CCID APDU done: response_len=%u sw=%04x", rapdu.len, rapdu.sw);
     return 0;
+}
+
+esp_err_t canokey_esp32p4_ccid_power_on(void)
+{
+    if (!canokey_port_core_lock(1000)) return ESP_ERR_INVALID_STATE;
+    esp_err_t ret = ccid_power_on_locked();
+    canokey_port_core_unlock();
+    return ret;
+}
+
+void canokey_esp32p4_ccid_power_off(void)
+{
+    if (!canokey_esp32p4_is_ready()) return;
+    /* A power-off must wait for a running APDU, including user presence. */
+    if (!canokey_port_core_lock(60000)) return;
+    ccid_power_off_locked();
+    canokey_port_core_unlock();
+}
+
+int canokey_esp32p4_process_ccid_apdu(const uint8_t *command, uint16_t command_len,
+                                  uint8_t *response, uint16_t response_size,
+                                  uint16_t *response_len, uint16_t *status_word)
+{
+    if (!canokey_port_core_lock(1000)) return -4;
+    int ret = process_ccid_apdu_locked(command, command_len, response, response_size, response_len, status_word);
+    canokey_port_core_unlock();
+    return ret;
 }

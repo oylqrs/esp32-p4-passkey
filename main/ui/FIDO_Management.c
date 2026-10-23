@@ -12,6 +12,8 @@
 #include "fs.h"
 #include "lvgl.h"
 #include "ui_nav.h"
+#include "ui/i18n/ui_i18n.h"
+#include "ui_status_bar.h"
 
 #define FIDO_MANAGEMENT_WIDTH       480
 #define FIDO_MANAGEMENT_MAX_RP_ROWS 24
@@ -159,22 +161,6 @@ static void load_fido_user_ids(void)
     }
 }
 
-static void add_status_bar(lv_obj_t *screen)
-{
-    lv_obj_t *status = lv_obj_create(screen);
-    lv_obj_remove_style_all(status);
-    lv_obj_set_size(status, FIDO_MANAGEMENT_WIDTH, 28);
-    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(status, lv_color_hex(0x0F1117), 0);
-    lv_obj_set_style_bg_opa(status, LV_OPA_COVER, 0);
-
-    lv_obj_t *title = lv_label_create(status);
-    lv_label_set_text(title, "FIDO_Management");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xD7DAE0), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-    lv_obj_align(title, LV_ALIGN_LEFT_MID, 12, 0);
-}
-
 static size_t load_fido_rp_items(void)
 {
     memset(s_rp_items, 0, sizeof(s_rp_items));
@@ -266,39 +252,39 @@ static void add_rp_row(lv_obj_t *parent, const fido_rp_item_t *item)
     lv_obj_align(rp_label, LV_ALIGN_TOP_LEFT, 88, 18);
 
     char count_text[32];
-    snprintf(count_text, sizeof(count_text), "credentials: %lu", (unsigned long)item->live_count);
+    snprintf(count_text, sizeof(count_text), ui_i18n_get(UI_STR_CREDENTIALS), (unsigned long)item->live_count);
     lv_obj_t *count_label = lv_label_create(row);
     lv_label_set_text(count_label, count_text);
     lv_obj_set_width(count_label, FIDO_MANAGEMENT_WIDTH - 150);
     lv_label_set_long_mode(count_label, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_color(count_label, lv_color_hex(0x9EA3AD), 0);
-    lv_obj_set_style_text_font(count_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(count_label, ui_i18n_font_16(), 0);
     lv_obj_align(count_label, LV_ALIGN_TOP_LEFT, 88, 56);
 
     char user_ids_text[FIDO_USER_IDS_TEXT_MAX + 16];
     snprintf(user_ids_text,
              sizeof(user_ids_text),
-             "usr.id: %s",
+             ui_i18n_get(UI_STR_USER_ID),
              item->user_ids[0] ? item->user_ids : "(none)");
     lv_obj_t *user_ids_label = lv_label_create(row);
     lv_label_set_text(user_ids_label, user_ids_text);
     lv_obj_set_width(user_ids_label, FIDO_MANAGEMENT_WIDTH - 150);
     lv_label_set_long_mode(user_ids_label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(user_ids_label, lv_color_hex(0xC5C9D1), 0);
-    lv_obj_set_style_text_font(user_ids_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(user_ids_label, ui_i18n_font_16(), 0);
     lv_obj_align(user_ids_label, LV_ALIGN_TOP_LEFT, 88, 80);
 
     char user_names_text[FIDO_USER_NAME_TEXT_MAX + 16];
     snprintf(user_names_text,
              sizeof(user_names_text),
-             "usr.name: %s",
+             ui_i18n_get(UI_STR_USER_NAME),
              item->user_names[0] ? item->user_names : "(none)");
     lv_obj_t *user_names_label = lv_label_create(row);
     lv_label_set_text(user_names_label, user_names_text);
     lv_obj_set_width(user_names_label, FIDO_MANAGEMENT_WIDTH - 150);
     lv_label_set_long_mode(user_names_label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_color(user_names_label, lv_color_hex(0xC5C9D1), 0);
-    lv_obj_set_style_text_font(user_names_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(user_names_label, ui_i18n_font_16(), 0);
     lv_obj_align(user_names_label, LV_ALIGN_TOP_LEFT, 88, 150);
 }
 
@@ -312,19 +298,19 @@ static void add_empty_state(lv_obj_t *parent)
     lv_obj_set_style_radius(panel, 4, 0);
 
     lv_obj_t *label = lv_label_create(panel);
-    lv_label_set_text(label, "No stored FIDO keys");
+    lv_label_set_text(label, ui_i18n_get(UI_STR_NO_FIDO_KEYS));
     lv_obj_set_width(label, FIDO_MANAGEMENT_WIDTH - 72);
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_color(label, lv_color_hex(0xD7DAE0), 0);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_font(label, ui_i18n_font_28(), 0);
     lv_obj_align(label, LV_ALIGN_CENTER, 0, -12);
 
     lv_obj_t *hint = lv_label_create(panel);
-    lv_label_set_text(hint, "Resident keys appear here after rk=true registration.");
+    lv_label_set_text(hint, ui_i18n_get(UI_STR_FIDO_KEYS_HINT));
     lv_obj_set_width(hint, FIDO_MANAGEMENT_WIDTH - 72);
     lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_color(hint, lv_color_hex(0x9EA3AD), 0);
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(hint, ui_i18n_font_16(), 0);
     lv_obj_align(hint, LV_ALIGN_CENTER, 0, 26);
 }
 
@@ -336,7 +322,7 @@ void FIDO_Management_show(void)
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x11141A), 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
 
-    add_status_bar(screen);
+    ui_status_bar_add(screen, FIDO_MANAGEMENT_WIDTH);
 
     lv_obj_t *list = lv_obj_create(screen);
     lv_obj_remove_style_all(list);

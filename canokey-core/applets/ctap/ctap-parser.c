@@ -444,35 +444,77 @@ uint8_t parse_verify_pub_key_cred_params(CborValue *val, int32_t *alg_type) {
 }
 
 uint8_t parse_credential_descriptor(CborValue *arr, uint8_t *id) {
-  if (cbor_value_get_type(arr) != CborMapType) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+  if (cbor_value_get_type(arr) != CborMapType) {
+    DBG_MSG("credential descriptor: expected map, got type %d\n", (int)cbor_value_get_type(arr));
+    return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+  }
 
   CborValue map;
   size_t map_length, len;
   bool found_id = false, found_type = false;
   int ret = cbor_value_get_map_length(arr, &map_length);
-  CHECK_CBOR_RET(ret);
+  if (ret != CborNoError) {
+    DBG_MSG("credential descriptor: failed to read map length, cbor=%#x\n", ret);
+    CHECK_CBOR_RET(ret);
+  }
   ret = cbor_value_enter_container(arr, &map);
-  CHECK_CBOR_RET(ret);
+  if (ret != CborNoError) {
+    DBG_MSG("credential descriptor: failed to enter map, cbor=%#x\n", ret);
+    CHECK_CBOR_RET(ret);
+  }
 
   for (size_t i = 0; i < map_length; ++i) {
     CHECK_CANCELLED_VALUE(&map);
     int key = ctap_text_key_id(&map);
-    if (key < 0) return (uint8_t)-key;
+    if (key < 0) {
+      DBG_MSG("credential descriptor: invalid map key, error=%#x\n", -key);
+      return (uint8_t)-key;
+    }
 
     if (key == CTAP_TEXT_KEY_ID) {
       found_id = true;
-      if (cbor_value_get_type(&map) != CborByteStringType) return CTAP2_ERR_MISSING_PARAMETER;
+      if (cbor_value_get_type(&map) != CborByteStringType) {
+        DBG_MSG("credential descriptor: id has type %d, expected byte string\n", (int)cbor_value_get_type(&map));
+        return CTAP2_ERR_MISSING_PARAMETER;
+      }
+      size_t id_len = 0;
+      ret = cbor_value_get_string_length(&map, &id_len);
+      if (ret != CborNoError) {
+        DBG_MSG("credential descriptor: failed to read id length, cbor=%#x\n", ret);
+        CHECK_CBOR_RET(ret);
+      }
+      DBG_MSG("credential descriptor: id length=%zu, capacity=%zu\n", id_len, sizeof(credential_id));
+      if (id_len != sizeof(credential_id))
+        DBG_MSG("credential descriptor: non-standard id length (expected %zu)\n", sizeof(credential_id));
       if (id) {
         len = sizeof(credential_id);
         ret = ctap_cbor_copy_bytes(&map, id, &len);
+        if (ret != CborNoError)
+          DBG_MSG("credential descriptor: id copy failed, id length=%zu capacity=%zu cbor=%#x\n", id_len,
+                  sizeof(credential_id), ret);
         CHECK_CBOR_RET(ret);
       } else {
         ret = cbor_value_advance(&map);
-        CHECK_CBOR_RET(ret);
+        if (ret != CborNoError) {
+          DBG_MSG("credential descriptor: failed to skip id, cbor=%#x\n", ret);
+          CHECK_CBOR_RET(ret);
+        }
       }
     } else if (key == CTAP_TEXT_KEY_TYPE) {
       found_type = true;
-      if (cbor_value_get_type(&map) != CborTextStringType) return CTAP2_ERR_MISSING_PARAMETER;
+      if (cbor_value_get_type(&map) != CborTextStringType) {
+        DBG_MSG("credential descriptor: type has type %d, expected text string\n", (int)cbor_value_get_type(&map));
+        return CTAP2_ERR_MISSING_PARAMETER;
+      }
+      size_t type_len = 0;
+      ret = cbor_value_get_string_length(&map, &type_len);
+      if (ret != CborNoError) {
+        DBG_MSG("credential descriptor: failed to read type length, cbor=%#x\n", ret);
+        CHECK_CBOR_RET(ret);
+      }
+      DBG_MSG("credential descriptor: type length=%zu\n", type_len);
+      if (type_len != sizeof("public-key") - 1)
+        DBG_MSG("credential descriptor: non-standard type length (expected %zu)\n", sizeof("public-key") - 1);
       ret = cbor_value_advance(&map);
       CHECK_CBOR_RET(ret);
     } else {
@@ -482,29 +524,45 @@ uint8_t parse_credential_descriptor(CborValue *arr, uint8_t *id) {
   }
 
   ret = cbor_value_leave_container(arr, &map);
+  if (ret != CborNoError) DBG_MSG("credential descriptor: failed to leave map, cbor=%#x\n", ret);
   CHECK_CBOR_RET(ret);
-  if (!found_id || !found_type) return CTAP2_ERR_MISSING_PARAMETER;
+  if (!found_id || !found_type) {
+    if (!found_id) DBG_MSG("credential descriptor: missing id\n");
+    if (!found_type) DBG_MSG("credential descriptor: missing type\n");
+    return CTAP2_ERR_MISSING_PARAMETER;
+  }
 
   return 0;
 }
 
-// In this function, we check if the exclude list contains only
+// In this function, we check that an allow/exclude list contains only
 // public-key-type credential IDs.
 uint8_t parse_public_key_credential_list(CborValue *lst, credential_id *ids, size_t capacity, size_t *count) {
   CborValue arr;
   size_t size;
-  if (cbor_value_get_type(lst) != CborArrayType) return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+  if (cbor_value_get_type(lst) != CborArrayType) {
+    DBG_MSG("credential list: expected array, got type %d\n", (int)cbor_value_get_type(lst));
+    return CTAP2_ERR_CBOR_UNEXPECTED_TYPE;
+  }
   int ret = cbor_value_get_array_length(lst, &size);
+  if (ret != CborNoError) DBG_MSG("credential list: failed to read array length, cbor=%#x\n", ret);
   CHECK_CBOR_RET(ret);
-  if (size > capacity) return CTAP2_ERR_LIMIT_EXCEEDED;
+  DBG_MSG("credential list: count=%zu capacity=%zu\n", size, capacity);
+  if (size > capacity) {
+    DBG_MSG("credential list: count exceeds capacity\n");
+    return CTAP2_ERR_LIMIT_EXCEEDED;
+  }
   ret = cbor_value_enter_container(lst, &arr);
+  if (ret != CborNoError) DBG_MSG("credential list: failed to enter array, cbor=%#x\n", ret);
   CHECK_CBOR_RET(ret);
   for (size_t i = 0; i < size; ++i) {
     CHECK_CANCELLED_VALUE(&arr);
     ret = parse_credential_descriptor(&arr, ids ? (uint8_t *)&ids[i] : NULL);
+    if (ret != 0) DBG_MSG("credential list: descriptor[%zu] parse failed, error=%#x\n", i, ret);
     CHECK_PARSER_RET(ret);
   }
   ret = cbor_value_leave_container(lst, &arr);
+  if (ret != CborNoError) DBG_MSG("credential list: failed to leave array, cbor=%#x\n", ret);
   CHECK_CBOR_RET(ret);
   if (count) *count = size;
   return 0;
@@ -1157,6 +1215,7 @@ static uint8_t parse_get_assertion_impl(CborParser *parser, CTAP_get_assertion *
     case GA_REQ_ALLOW_LIST:
       DBG_MSG("allow_list found\n");
       ret = parse_public_key_credential_list(&map, ga->allow_list, MAX_CREDENTIAL_COUNT_IN_LIST, &ga->allow_list_size);
+      if (ret != 0) DBG_MSG("allow_list parse failed, error=%#x\n", ret);
       CHECK_PARSER_RET(ret);
       DBG_MSG("allow_list size: %d\n", (int)ga->allow_list_size);
       break;

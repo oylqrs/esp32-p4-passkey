@@ -1,6 +1,8 @@
 # Name,   Type, SubType, Offset,    Size,      Flags
 nvs,      data, nvs,     0x9000,    0x6000,
 phy_init, data, phy,     0xf000,    0x1000,
-factory,  app,  factory, 0x10000,   0xEF0000,
+ota_0,    app,  ota_0,   0x10000,   0x770000,
+ota_1,    app,  ota_1,   0x780000,  0x770000,
+otadata,  data, ota,     0xEF0000,  0x2000,
 canokey_lfs, data, 0x40, 0xF00000,  0x100000,
 usbstore, data, fat,     0x1000000, 0x1000000,

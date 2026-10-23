@@ -96,7 +96,7 @@ int canokey_gpg_flash_write_file(const char *path, const void *buf, lfs_soff_t o
 {
     char mapped[32];
     const char *real_path = canokey_gpg_map_path(path, mapped, sizeof(mapped));
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "GPG file write path=%s real=%s slot=%u off=%ld len=%lu trunc=%u",
              path,
              real_path,
@@ -104,16 +104,8 @@ int canokey_gpg_flash_write_file(const char *path, const void *buf, lfs_soff_t o
              (long)off,
              (unsigned long)len,
              trunc);
-    if (buf && len > 0) {
-        lfs_size_t dump_len = len > 128 ? 128 : len;
-        ESP_LOGI(TAG, "GPG file write preview len=%lu/%lu",
-                 (unsigned long)dump_len,
-                 (unsigned long)len);
-        ESP_LOG_BUFFER_HEXDUMP(TAG, buf, dump_len, ESP_LOG_INFO);
-    }
-
     int ret = __real_write_file(real_path, buf, off, len, trunc);
-    ESP_LOGI(TAG, "GPG file write result path=%s real=%s ret=%d", path, real_path, ret);
+    ESP_LOGD(TAG, "GPG file write result path=%s real=%s ret=%d", path, real_path, ret);
     return ret;
 }
 
@@ -122,7 +114,7 @@ int canokey_gpg_flash_read_file(const char *path, void *buf, lfs_soff_t off, lfs
     char mapped[32];
     const char *real_path = canokey_gpg_map_path(path, mapped, sizeof(mapped));
     int ret = __real_read_file(real_path, buf, off, len);
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "GPG file read path=%s real=%s slot=%u off=%ld request_len=%lu ret=%d",
              path,
              real_path,
@@ -137,23 +129,15 @@ int canokey_gpg_flash_write_attr(const char *path, uint8_t attr, const void *buf
 {
     char mapped[32];
     const char *real_path = canokey_gpg_map_path(path, mapped, sizeof(mapped));
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "GPG attr write path=%s real=%s slot=%u attr=0x%02x len=%lu",
              path,
              real_path,
              (unsigned)(s_gpg_slot + 1),
              attr,
              (unsigned long)len);
-    if (buf && len > 0) {
-        lfs_size_t dump_len = len > 128 ? 128 : len;
-        ESP_LOGI(TAG, "GPG attr write preview len=%lu/%lu",
-                 (unsigned long)dump_len,
-                 (unsigned long)len);
-        ESP_LOG_BUFFER_HEXDUMP(TAG, buf, dump_len, ESP_LOG_INFO);
-    }
-
     int ret = __real_write_attr(real_path, attr, buf, len);
-    ESP_LOGI(TAG, "GPG attr write result path=%s real=%s attr=0x%02x ret=%d", path, real_path, attr, ret);
+    ESP_LOGD(TAG, "GPG attr write result path=%s real=%s attr=0x%02x ret=%d", path, real_path, attr, ret);
     return ret;
 }
 
@@ -162,7 +146,7 @@ int canokey_gpg_flash_read_attr(const char *path, uint8_t attr, void *buf, lfs_s
     char mapped[32];
     const char *real_path = canokey_gpg_map_path(path, mapped, sizeof(mapped));
     int ret = __real_read_attr(real_path, attr, buf, len);
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "GPG attr read path=%s real=%s slot=%u attr=0x%02x request_len=%lu ret=%d",
              path,
              real_path,
@@ -170,16 +154,6 @@ int canokey_gpg_flash_read_attr(const char *path, uint8_t attr, void *buf, lfs_s
              attr,
              (unsigned long)len,
              ret);
-    if (ret > 0 && buf && len > 0) {
-        lfs_size_t dump_len = (lfs_size_t)ret > len ? len : (lfs_size_t)ret;
-        if (dump_len > 128) {
-            dump_len = 128;
-        }
-        ESP_LOGI(TAG, "GPG attr read preview len=%lu/%d",
-                 (unsigned long)dump_len,
-                 ret);
-        ESP_LOG_BUFFER_HEXDUMP(TAG, buf, dump_len, ESP_LOG_INFO);
-    }
     return ret;
 }
 
@@ -188,7 +162,7 @@ int canokey_gpg_flash_remove_attr(const char *path, uint8_t attr)
     char mapped[32];
     const char *real_path = canokey_gpg_map_path(path, mapped, sizeof(mapped));
     int ret = __real_remove_attr(real_path, attr);
-    ESP_LOGI(TAG, "GPG attr remove path=%s real=%s slot=%u attr=0x%02x ret=%d",
+    ESP_LOGD(TAG, "GPG attr remove path=%s real=%s slot=%u attr=0x%02x ret=%d",
              path,
              real_path,
              (unsigned)(s_gpg_slot + 1),
@@ -202,7 +176,7 @@ int canokey_gpg_flash_get_file_size(const char *path)
     char mapped[32];
     const char *real_path = canokey_gpg_map_path(path, mapped, sizeof(mapped));
     int ret = __real_get_file_size(real_path);
-    ESP_LOGI(TAG, "GPG file size path=%s real=%s slot=%u ret=%d",
+    ESP_LOGD(TAG, "GPG file size path=%s real=%s slot=%u ret=%d",
              path,
              real_path,
              (unsigned)(s_gpg_slot + 1),
@@ -215,7 +189,7 @@ int canokey_gpg_flash_remove_file(const char *path)
     char mapped[32];
     const char *real_path = canokey_gpg_map_path(path, mapped, sizeof(mapped));
     int ret = __real_remove_file(real_path);
-    ESP_LOGI(TAG, "GPG file remove path=%s real=%s slot=%u ret=%d",
+    ESP_LOGD(TAG, "GPG file remove path=%s real=%s slot=%u ret=%d",
              path,
              real_path,
              (unsigned)(s_gpg_slot + 1),

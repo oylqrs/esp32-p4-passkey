@@ -103,15 +103,17 @@ uint8_t wait_for_user_presence(uint8_t entry) {
   }
 
   if (wait_status == WAIT_NONE) {
+    // A user-presence result is valid only for the prompt about to be issued.
+    set_touch_result(TOUCH_NO);
     switch (entry) {
     case WAIT_ENTRY_CCID:
       wait_status = WAIT_CCID;
       break;
     case WAIT_ENTRY_CTAPHID:
       wait_status = WAIT_CTAPHID;
-      device_user_presence_request(entry);
       break;
     }
+    device_user_presence_request(entry);
   } else {
     // New user presence test is denied while a test is ongoing
     DBG_MSG("Denied\n");
@@ -150,11 +152,12 @@ uint8_t wait_for_user_presence(uint8_t entry) {
 #endif
     }
   }
+  const uint8_t result = get_touch_result();
   // Consume this touch event
   set_touch_result(TOUCH_NO);
   stop_blinking();
   wait_status = WAIT_NONE;
-  return USER_PRESENCE_OK;
+  return result == TOUCH_CANCEL ? USER_PRESENCE_CANCEL : USER_PRESENCE_OK;
 }
 
 int send_keepalive_during_processing(uint8_t entry) {

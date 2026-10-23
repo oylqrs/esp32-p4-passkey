@@ -13,8 +13,11 @@
 #include "esp_log.h"
 #include "fs.h"
 #include "lvgl.h"
+#include "nvs.h"
 #include "openpgp.h"
+#include "piv.h"
 #include "ui_nav.h"
+#include "ui_status_bar.h"
 #include "usb_ccid.h"
 #include "usb_hid_keyboard.h"
 
@@ -33,9 +36,40 @@
 #define OPENPGP_SN_LEN    4
 #define OPENPGP_SN_TEXT_LEN (OPENPGP_SN_LEN * 3)
 #define OPENPGP_VALUE_LEN 256
+#define SMARTCARD_NVS_NAMESPACE "sc_ui"
+#define SMARTCARD_SLOT_NVS_KEY  "selected_card"
 
 static const char *TAG = "openpgp_ui";
 static uint8_t s_openpgp_ui_slot;
+
+static uint8_t read_selected_card(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(SMARTCARD_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return 0;
+    }
+    uint8_t slot = 0;
+    (void)nvs_get_u8(nvs, SMARTCARD_SLOT_NVS_KEY, &slot);
+    nvs_close(nvs);
+    return slot < CANOKEY_GPG_SLOT_COUNT && slot < CANOKEY_PIV_SLOT_COUNT
+               ? slot
+               : 0;
+}
+
+static esp_err_t write_selected_card(uint8_t slot)
+{
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open(SMARTCARD_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = nvs_set_u8(nvs, SMARTCARD_SLOT_NVS_KEY, slot);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return ret;
+}
 
 typedef struct {
     const char *label;
@@ -199,28 +233,6 @@ static void load_openpgp_card_data(openpgp_card_data_t *data)
     read_fingerprint("pgp-autk", data->aut, sizeof(data->aut));
 }
 
-static void add_status_bar(lv_obj_t *screen)
-{
-    lv_obj_t *status = lv_obj_create(screen);
-    lv_obj_remove_style_all(status);
-    lv_obj_set_size(status, OPENPGP_UI_WIDTH, 38);
-    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(status, lv_color_hex(0x0F1117), 0);
-    lv_obj_set_style_bg_opa(status, LV_OPA_COVER, 0);
-
-    lv_obj_t *time_label = lv_label_create(status);
-    lv_label_set_text(time_label, "07-30 16:47");
-    lv_obj_set_style_text_color(time_label, lv_color_hex(0x9EA3AD), 0);
-    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_24, 0);
-    lv_obj_align(time_label, LV_ALIGN_LEFT_MID, 12, 0);
-
-    lv_obj_t *battery = lv_label_create(status);
-    lv_label_set_text(battery, LV_SYMBOL_BATTERY_FULL);
-    lv_obj_set_style_text_color(battery, lv_color_hex(0x9EA3AD), 0);
-    lv_obj_set_style_text_font(battery, &lv_font_montserrat_24, 0);
-    lv_obj_align(battery, LV_ALIGN_RIGHT_MID, -12, 0);
-}
-
 static lv_obj_t *add_panel(lv_obj_t *parent, int32_t height)
 {
     lv_obj_t *panel = lv_obj_create(parent);
@@ -245,10 +257,14 @@ static void openpgp_slot_event_cb(lv_event_t *event)
         return;
     }
 
-    s_openpgp_ui_slot = (uint8_t)selected;
-    if (canokey_gpg_select_slot(s_openpgp_ui_slot) < 0 || openpgp_install(0) < 0) {
-        ESP_LOGW(TAG, "OpenPGP slot %u select failed", (unsigned)(s_openpgp_ui_slot + 1));
+    esp_err_t ret = write_selected_card((uint8_t)selected);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to save selected smart card: %s",
+                 esp_err_to_name(ret));
+        lv_dropdown_set_selected(dropdown, s_openpgp_ui_slot);
+        return;
     }
+    s_openpgp_ui_slot = (uint8_t)selected;
     openpgp_ui_show();
 }
 
@@ -409,13 +425,20 @@ void openpgp_ui_show(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "SmartCard reader enable failed: %s", esp_err_to_name(ret));
     }
-    if (canokey_piv_select_slot(0) < 0) {
-        ESP_LOGW(TAG, "PIV slot reset failed");
+    s_openpgp_ui_slot = read_selected_card();
+    bool slot_changed = canokey_gpg_get_slot() != s_openpgp_ui_slot ||
+                        canokey_piv_get_slot() != s_openpgp_ui_slot;
+    if (slot_changed) {
+        usb_ccid_deactivate_card();
+        if (canokey_gpg_select_slot(s_openpgp_ui_slot) < 0 ||
+            canokey_piv_select_slot(s_openpgp_ui_slot) < 0 ||
+            openpgp_install(0) < 0 ||
+            piv_install(0) < 0) {
+            ESP_LOGW(TAG, "Smart card %u select failed",
+                     (unsigned)(s_openpgp_ui_slot + 1));
+        }
     }
-    if (canokey_gpg_select_slot(s_openpgp_ui_slot) < 0 || openpgp_install(0) < 0) {
-        ESP_LOGW(TAG, "OpenPGP slot %u select failed", (unsigned)(s_openpgp_ui_slot + 1));
-    }
-    if (!usb_ccid_activate_openpgp_card()) {
+    if (!usb_ccid_card_is_inserted() && !usb_ccid_activate_openpgp_card()) {
         ESP_LOGW(TAG, "OpenPGP virtual card activation delayed or failed");
     }
 
@@ -425,7 +448,7 @@ void openpgp_ui_show(void)
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x11141A), 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
 
-    add_status_bar(screen);
+    ui_status_bar_add(screen, OPENPGP_UI_WIDTH);
 
     lv_obj_t *list = lv_obj_create(screen);
     lv_obj_remove_style_all(list);

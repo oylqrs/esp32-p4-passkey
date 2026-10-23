@@ -72,24 +72,17 @@ int __wrap_write_file(const char *path, const void *buf, lfs_soff_t off, lfs_siz
     }
 
     if (is_ctap_resident_file(path) || is_ctap_key_file(path)) {
-        ESP_LOGW(TAG,
+        ESP_LOGD(TAG,
                  "CTAP flash write path=%s off=%ld len=%lu trunc=%u",
                  path,
                  (long)off,
                  (unsigned long)len,
                  trunc);
-        if (buf && len > 0) {
-            lfs_size_t dump_len = len > 128 ? 128 : len;
-            ESP_LOGW(TAG, "CTAP flash write data preview len=%lu/%lu",
-                     (unsigned long)dump_len,
-                     (unsigned long)len);
-            ESP_LOG_BUFFER_HEXDUMP(TAG, buf, dump_len, ESP_LOG_WARN);
-        }
     }
 
     int ret = __real_write_file(path, buf, off, len, trunc);
     if (is_ctap_resident_file(path) || is_ctap_key_file(path)) {
-        ESP_LOGW(TAG, "CTAP flash write result path=%s ret=%d", path, ret);
+        ESP_LOGD(TAG, "CTAP flash write result path=%s ret=%d", path, ret);
     }
     return ret;
 }
@@ -116,20 +109,17 @@ int __wrap_write_attr(const char *path, uint8_t attr, const void *buf, lfs_size_
     }
 
     if ((path && strcmp(path, "ctap_dc") == 0) || is_ctap_key_file(path)) {
-        ESP_LOGW(TAG,
+        ESP_LOGD(TAG,
                  "CTAP flash attr write path=%s attr=0x%02x(%s) len=%lu",
                  path,
                  attr,
                  is_ctap_key_file(path) ? ctap_cert_attr_name(attr) : "DC_GENERAL_ATTR",
                  (unsigned long)len);
-        if (buf && len > 0) {
-            ESP_LOG_BUFFER_HEXDUMP(TAG, buf, len, ESP_LOG_WARN);
-        }
     }
 
     int ret = __real_write_attr(path, attr, buf, len);
     if ((path && strcmp(path, "ctap_dc") == 0) || is_ctap_key_file(path)) {
-        ESP_LOGW(TAG, "CTAP flash attr write result path=%s attr=0x%02x(%s) ret=%d",
+        ESP_LOGD(TAG, "CTAP flash attr write result path=%s attr=0x%02x(%s) ret=%d",
                  path,
                  attr,
                  is_ctap_key_file(path) ? ctap_cert_attr_name(attr) : "DC_GENERAL_ATTR",
@@ -149,21 +139,13 @@ int __wrap_read_attr(const char *path, uint8_t attr, void *buf, lfs_size_t len)
 
     int ret = __real_read_attr(path, attr, buf, len);
     if ((path && strcmp(path, "ctap_dc") == 0) || is_ctap_key_file(path)) {
-        ESP_LOGW(TAG,
+        ESP_LOGD(TAG,
                  "CTAP flash attr read path=%s attr=0x%02x(%s) request_len=%lu ret=%d",
                  path,
                  attr,
                  is_ctap_key_file(path) ? ctap_cert_attr_name(attr) : "DC_GENERAL_ATTR",
                  (unsigned long)len,
                  ret);
-        if (ret > 0 && buf && len > 0) {
-            lfs_size_t dump_len = (lfs_size_t)ret > len ? len : (lfs_size_t)ret;
-            ESP_LOGW(TAG,
-                     "CTAP flash attr read data preview len=%lu/%d",
-                     (unsigned long)dump_len,
-                     ret);
-            ESP_LOG_BUFFER_HEXDUMP(TAG, buf, dump_len, ESP_LOG_WARN);
-        }
     }
     return ret;
 }

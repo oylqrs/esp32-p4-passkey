@@ -9,6 +9,7 @@
 #include "openpgp_ui.h"
 #include "ui_piv_detail.h"
 #include "ui_nav.h"
+#include "ui_status_bar.h"
 #include "usb_ccid.h"
 #include "usb_hid_keyboard.h"
 
@@ -26,28 +27,6 @@ typedef struct {
 static const lv_font_t *smartcard_text_font(void)
 {
     return &lv_font_montserrat_28;
-}
-
-static void add_status_bar(lv_obj_t *screen)
-{
-    lv_obj_t *status = lv_obj_create(screen);
-    lv_obj_remove_style_all(status);
-    lv_obj_set_size(status, SMARTCARD_UI_WIDTH, 100);
-    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(status, lv_color_hex(0x0F1117), 0);
-    lv_obj_set_style_bg_opa(status, LV_OPA_COVER, 0);
-
-    lv_obj_t *time_label = lv_label_create(status);
-    lv_label_set_text(time_label, "07-30 16:47");
-    lv_obj_set_style_text_color(time_label, lv_color_hex(0x9EA3AD), 0);
-    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_28, 0);
-    lv_obj_align(time_label, LV_ALIGN_TOP_RIGHT, -60, 3);
-
-    lv_obj_t *battery = lv_label_create(status);
-    lv_label_set_text(battery, LV_SYMBOL_BATTERY_FULL);
-    lv_obj_set_style_text_color(battery, lv_color_hex(0x9EA3AD), 0);
-    lv_obj_set_style_text_font(battery, &lv_font_montserrat_28, 0);
-    lv_obj_align(battery, LV_ALIGN_TOP_RIGHT, -8, 3);
 }
 
 static void smartcard_item_event_cb(lv_event_t *event)
@@ -115,7 +94,7 @@ void smartcard_ui_show(void)
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x11141A), 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
 
-    add_status_bar(screen);
+    ui_status_bar_add(screen, SMARTCARD_UI_WIDTH);
 
     lv_obj_t *list = lv_obj_create(screen);
     lv_obj_remove_style_all(list);

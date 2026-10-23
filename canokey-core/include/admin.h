@@ -153,6 +153,8 @@ int admin_vendor_nfc_enable(const CAPDU *capdu, RAPDU *rapdu, bool pin_validated
  */
 int admin_platform_device_config_read(admin_device_config_t *cfg);
 int admin_platform_device_config_write(const admin_device_config_t *cfg);
+int admin_device_config_set_ccid_enabled(uint8_t openpgp_enabled,
+                                         uint8_t piv_enabled);
 int admin_platform_serial_read(uint8_t *buf);
 int admin_platform_serial_write_once(const uint8_t *buf);
 /*

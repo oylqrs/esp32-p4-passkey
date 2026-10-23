@@ -420,9 +420,12 @@ static void test_wait_for_user_presence_ok(void **state) {
 
   reset_test_state();
   device_init();
+  auto_touch_mode = AUTO_TOUCH_WHEN_BLINKING;
+  // A stale result from an earlier prompt must not satisfy this wait.
   set_touch_result(TOUCH_SHORT);
 
   assert_int_equal(wait_for_user_presence(WAIT_ENTRY_CCID), USER_PRESENCE_OK);
+  assert_true(ctaphid_loop_wait_calls > 0);
   assert_int_equal(get_touch_result(), TOUCH_NO);
   assert_false(device_is_blinking());
 }

@@ -1,5 +1,6 @@
 ﻿#include "usb_ccid.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 #include "canokey_esp32p4.h"
@@ -25,6 +26,8 @@
 #define CCID_RX_SIZE 1024u
 #define CCID_DUMP_MAX_BYTES 128u
 #define CCID_INT_MSG_SIZE 2u
+#define CCID_INTERRUPT_STACK_SIZE 4096u
+#define CCID_READY_STACK_SIZE 4096u
 #define CCID_WORKER_STACK_SIZE 24576u
 #define CCID_WORKER_PRIORITY 5u
 #define CCID_SLOT_NO_ERROR 0x00u
@@ -56,19 +59,21 @@ static uint8_t s_ccid_int_msg[CCID_INT_MSG_SIZE] __attribute__((aligned(64))) = 
 static uint8_t s_ccid_ep_out;
 static uint8_t s_ccid_ep_in;
 static uint8_t s_ccid_ep_int_in;
-static bool s_ccid_card_active;
-static bool s_ccid_card_inserted;
+static volatile bool s_ccid_card_active;
+static volatile bool s_ccid_card_inserted;
 static bool s_ccid_rx_armed;
-static bool s_ccid_int_in_busy;
-static bool s_ccid_int_task_started;
-static bool s_ccid_ready_task_started;
-static bool s_ccid_worker_busy;
+static volatile bool s_ccid_int_in_busy;
+static volatile bool s_ccid_int_task_started;
+static volatile bool s_ccid_removal_pending;
+static atomic_bool s_ccid_ready_task_started;
+static volatile bool s_ccid_worker_busy;
 static uint8_t s_ccid_worker_rhport;
 static uint32_t s_ccid_worker_rx_len;
 static TaskHandle_t s_ccid_worker_task_handle;
 static const char *TAG = "usb_ccid";
 
 static bool ccid_start_rx(uint8_t rhport);
+static void ccid_start_interrupt_task(void);
 
 static void ccid_log_response(const uint8_t *response, size_t response_len)
 {
@@ -140,19 +145,48 @@ static void ccid_interrupt_task(void *arg)
 {
     (void)arg;
 
-    /* Notify insertion once after the device is mounted. Do not repeatedly
-     * report a stable state: 0x03 is the insertion/change event. */
     vTaskDelay(pdMS_TO_TICKS(100));
-    if (tud_mounted() && s_ccid_ep_int_in && !s_ccid_int_in_busy) {
-        if (usbd_edpt_xfer(0, s_ccid_ep_int_in, s_ccid_int_msg, sizeof(s_ccid_int_msg))) {
+
+    bool send_removal = s_ccid_removal_pending;
+    s_ccid_removal_pending = false;
+    if (send_removal && tud_mounted() && s_ccid_ep_int_in) {
+        s_ccid_int_msg[1] = 0x02;
+        if (usbd_edpt_xfer(0, s_ccid_ep_int_in,
+                          s_ccid_int_msg, sizeof(s_ccid_int_msg))) {
             s_ccid_int_in_busy = true;
-            ESP_LOGI(TAG, "CCID INT IN msg=0x%02x state=0x%02x",
-                     s_ccid_int_msg[0], s_ccid_int_msg[1]);
+            ESP_LOGI(TAG, "CCID card removal notified");
+            for (int i = 0; i < 100 && s_ccid_int_in_busy; i++) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
         } else {
-            ESP_LOGW(TAG, "CCID INT IN submit failed: ep=0x%02x", s_ccid_ep_int_in);
+            ESP_LOGW(TAG, "CCID removal notify failed: ep=0x%02x",
+                     s_ccid_ep_int_in);
         }
     }
+
+    if (send_removal && s_ccid_card_inserted) {
+        /* Give PC/SC enough time to invalidate the previous PKCS#15 token
+         * before announcing the replacement card on the same CCID slot. */
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    if (s_ccid_card_inserted && tud_mounted() && s_ccid_ep_int_in &&
+        !s_ccid_int_in_busy) {
+        s_ccid_int_msg[1] = 0x03;
+        if (usbd_edpt_xfer(0, s_ccid_ep_int_in,
+                          s_ccid_int_msg, sizeof(s_ccid_int_msg))) {
+            s_ccid_int_in_busy = true;
+            ESP_LOGI(TAG, "CCID card insertion notified");
+        } else {
+            ESP_LOGW(TAG, "CCID insertion notify failed: ep=0x%02x",
+                     s_ccid_ep_int_in);
+        }
+    }
+
     s_ccid_int_task_started = false;
+    if (s_ccid_removal_pending) {
+        ccid_start_interrupt_task();
+    }
     vTaskDelete(NULL);
 }
 
@@ -161,7 +195,7 @@ static void ccid_start_interrupt_task(void)
     if (s_ccid_int_task_started) {
         return;
     }
-    if (xTaskCreate(ccid_interrupt_task, "ccid_int", 2048, NULL, 4, NULL) == pdPASS) {
+    if (xTaskCreate(ccid_interrupt_task, "ccid_int", CCID_INTERRUPT_STACK_SIZE, NULL, 4, NULL) == pdPASS) {
         s_ccid_int_task_started = true;
     } else {
         ESP_LOGW(TAG, "Failed to create CCID interrupt notify task");
@@ -190,18 +224,22 @@ static void ccid_ready_task(void *arg)
                  s_ccid_ep_in);
     }
 
-    s_ccid_ready_task_started = false;
+    atomic_store_explicit(&s_ccid_ready_task_started, false, memory_order_release);
     vTaskDelete(NULL);
 }
 
 static void ccid_start_ready_task(void)
 {
-    if (s_ccid_ready_task_started) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&s_ccid_ready_task_started,
+                                                  &expected,
+                                                  true,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
         return;
     }
-    if (xTaskCreate(ccid_ready_task, "ccid_ready", 2048, NULL, 4, NULL) == pdPASS) {
-        s_ccid_ready_task_started = true;
-    } else {
+    if (xTaskCreate(ccid_ready_task, "ccid_ready", CCID_READY_STACK_SIZE, NULL, 4, NULL) != pdPASS) {
+        atomic_store_explicit(&s_ccid_ready_task_started, false, memory_order_release);
         ESP_LOGW(TAG, "Failed to create CCID ready task");
     }
 }
@@ -214,7 +252,8 @@ static bool ccid_start_rx(uint8_t rhport)
         return false;
     }
     if (!s_ccid_ep_out || !s_ccid_ep_in) {
-        ESP_LOGW(TAG, "CCID OUT arm skipped: ep_out=0x%02x ep_in=0x%02x", s_ccid_ep_out, s_ccid_ep_in);
+        ESP_LOGI(TAG, "CCID OUT arm delayed until enumeration: ep_out=0x%02x ep_in=0x%02x",
+                 s_ccid_ep_out, s_ccid_ep_in);
         ccid_start_ready_task();
         return false;
     }
@@ -241,7 +280,7 @@ static void ccid_driver_reset(uint8_t rhport)
     s_ccid_ep_int_in = 0;
     s_ccid_rx_armed = false;
     s_ccid_int_in_busy = false;
-    s_ccid_ready_task_started = false;
+    s_ccid_removal_pending = false;
     s_ccid_worker_busy = false;
     s_ccid_card_active = false;
     (void)rhport;
@@ -391,7 +430,6 @@ bool usb_ccid_activate_card(void)
 {
     s_ccid_card_inserted = true;
     s_ccid_card_active = false;
-    s_ccid_int_msg[1] = 0x03;
     ccid_start_interrupt_task();
     return usb_ccid_start();
 }
@@ -405,14 +443,43 @@ void usb_ccid_deactivate_card(void)
 {
     bool notify_removal = s_ccid_card_inserted || s_ccid_card_active;
 
-    canokey_esp32p4_ccid_power_off();
     s_ccid_card_inserted = false;
+
+    /* Stop accepting APDUs for the old card and let an in-flight command
+     * finish before changing the applet session or its LittleFS slot. */
+    for (int i = 0; i < 150 && s_ccid_worker_busy; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (s_ccid_worker_busy) {
+        ESP_LOGW(TAG, "CCID worker did not become idle before card removal");
+    }
+
+    canokey_esp32p4_ccid_power_off();
     s_ccid_card_active = false;
 
     if (notify_removal) {
-        s_ccid_int_msg[1] = 0x02;
+        s_ccid_removal_pending = true;
         ccid_start_interrupt_task();
+
+        /* Do not let callers install another virtual card until PC/SC has
+         * received the removal event for the previous card. */
+        for (int i = 0; i < 150 &&
+                        (s_ccid_removal_pending || s_ccid_int_task_started ||
+                         s_ccid_int_in_busy); i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (s_ccid_removal_pending || s_ccid_int_task_started ||
+            s_ccid_int_in_busy) {
+            ESP_LOGW(TAG, "CCID card removal notification timed out");
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
     }
+}
+
+bool usb_ccid_card_is_inserted(void)
+{
+    return s_ccid_card_inserted;
 }
 
 static void write_u32_le(uint8_t *d, uint32_t v)
@@ -523,9 +590,10 @@ size_t usb_ccid_process_message(const uint8_t *r, size_t n, uint8_t *o, size_t c
         return CCID_HEADER_SIZE;
     }
     if (cmd == CCID_PC_TO_RDR_ICCPOWEROFF) {
-        /* Windows/scdaemon sends 0x63 repeatedly in this virtual-reader path.
-         * Treat it as a harmless slot-status poll; dropping the applet session
-         * here makes the card disappear and clears PW3 between APDUs. */
+        canokey_esp32p4_ccid_power_off();
+        s_ccid_card_active = false;
+        memcpy(s_ccid_t1_params, s_ccid_default_t1_params,
+               sizeof(s_ccid_t1_params));
         return ccid_reply_slot_status(o, slot, seq);
     }
     if (cmd == CCID_PC_TO_RDR_GETSLOTSTATUS) {

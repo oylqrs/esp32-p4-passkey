@@ -10,3 +10,4 @@ bool usb_ccid_start(void);
 bool usb_ccid_activate_card(void);
 bool usb_ccid_activate_openpgp_card(void);
 void usb_ccid_deactivate_card(void);
+bool usb_ccid_card_is_inserted(void);

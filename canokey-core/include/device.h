@@ -10,6 +10,7 @@
 #define TOUCH_NO 0
 #define TOUCH_SHORT 1
 #define TOUCH_LONG 2
+#define TOUCH_CANCEL 3
 
 #define USER_PRESENCE_OK 0
 #define USER_PRESENCE_CANCEL 1

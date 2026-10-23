@@ -1,59 +1,157 @@
 #include "ui_clock_desktop.h"
 
 #include <stdio.h>
-#include <time.h>
 
+#include "ADC/battery_monitor.h"
+#include "PCF85063/pcf85063.h"
 #include "lvgl.h"
-#include "ui/UI_SCREEN1.h"
+#include "setup_ui.h"
+#include "ui/unlock_pin_ui.h"
 #include "ui_nav.h"
-
+#include "usb_hid_keyboard.h"
+/*160*4 */
 #define CLOCK_DESKTOP_WIDTH  480
 #define CLOCK_DESKTOP_HEIGHT 640
-#define CLOCK_LEFT_MARGIN    22
-#define CLOCK_TEXT_SCALE     512
+#define CLOCK_TIME_SCALE     512
+#define CLOCK_DATE_SCALE     512
+#define CLOCK_YEAR_SCALE     512
+#define CLOCK_LEFT_MARGIN    10
 
-typedef struct {
-    lv_obj_t *time;
-    lv_obj_t *year;
-    lv_obj_t *month;
-    lv_obj_t *day;
-} clock_desktop_labels_t;
+#define CLOCK_TIME_Y         56
+#define CLOCK_YEAR_Y         200
+#define CLOCK_MONTH_Y        344
+#define CLOCK_DAY_Y          488
+#define CLOCK_HM_MD_TIME_Y   80
+#define CLOCK_HM_MD_MONTH_Y  272
+#define CLOCK_HM_MD_DAY_Y    440
+#define CLOCK_HM_TIME_Y      224
+#define CLOCK_BATTERY_REFRESH_MS 1000
+#define CLOCK_RTC_REFRESH_MS 1000
+#define CLOCK_STATUS_TEXT_COLOR 0x9EA3AD
+#define CLOCK_USB_COLOR         0x34C759
 
-static lv_timer_t *s_clock_timer;
-static clock_desktop_labels_t s_clock_labels;
+LV_FONT_DECLARE(font_clock_96);
 
-static void clock_desktop_stop_timer(void)
+static lv_obj_t *s_battery_icon;
+static lv_obj_t *s_battery_label;
+static lv_timer_t *s_battery_timer;
+static lv_obj_t *s_time_label;
+static lv_obj_t *s_year_label;
+static lv_obj_t *s_month_label;
+static lv_obj_t *s_day_label;
+static lv_timer_t *s_rtc_timer;
+
+static void clock_rtc_update(void)
 {
-    if (s_clock_timer) {
-        lv_timer_delete(s_clock_timer);
-        s_clock_timer = NULL;
+    if (!s_time_label) {
+        return;
     }
+
+    pcf85063_time_t time;
+    esp_err_t ret = pcf85063_get_time(&time);
+    if (ret != ESP_OK) {
+        lv_label_set_text(s_time_label, "--:--");
+        if (s_year_label) lv_label_set_text(s_year_label, "----");
+        if (s_month_label) lv_label_set_text(s_month_label, "--");
+        if (s_day_label) lv_label_set_text(s_day_label, "--");
+        return;
+    }
+
+    lv_label_set_text_fmt(s_time_label, "%02u:%02u", time.hour, time.minute);
+    if (s_year_label) lv_label_set_text_fmt(s_year_label, "%04u", time.year);
+    if (s_month_label) lv_label_set_text_fmt(s_month_label, "%02u", time.month);
+    if (s_day_label) lv_label_set_text_fmt(s_day_label, "%02u", time.day);
 }
 
-static void clock_desktop_update(void)
-{
-    time_t now = time(NULL);
-    struct tm tm_now;
-    localtime_r(&now, &tm_now);
-
-    char text[16];
-    snprintf(text, sizeof(text), "%02d:%02d", tm_now.tm_hour, tm_now.tm_min);
-    lv_label_set_text(s_clock_labels.time, text);
-
-    snprintf(text, sizeof(text), "%04d", tm_now.tm_year + 1900);
-    lv_label_set_text(s_clock_labels.year, text);
-
-    snprintf(text, sizeof(text), "%02d", tm_now.tm_mon + 1);
-    lv_label_set_text(s_clock_labels.month, text);
-
-    snprintf(text, sizeof(text), "%02d", tm_now.tm_mday);
-    lv_label_set_text(s_clock_labels.day, text);
-}
-
-static void clock_timer_cb(lv_timer_t *timer)
+static void clock_rtc_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
-    clock_desktop_update();
+    clock_rtc_update();
+}
+
+static void clock_battery_update(void)
+{
+    if (!s_battery_icon || !s_battery_label) {
+        return;
+    }
+
+    int percent = battery_monitor_get_percent();
+    if (percent >= 0) {
+        lv_label_set_text_fmt(s_battery_label, "%d%%", percent);
+    } else {
+        lv_label_set_text(s_battery_label, "--");
+    }
+    lv_obj_set_style_text_color(
+        s_battery_icon,
+        lv_color_hex(usb_hid_keyboard_is_ready() ? CLOCK_USB_COLOR :
+                                                   CLOCK_STATUS_TEXT_COLOR),
+        0);
+}
+
+static void clock_battery_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    clock_battery_update();
+}
+
+static void clock_battery_delete_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_DELETE) {
+        return;
+    }
+
+    if (s_battery_timer) {
+        lv_timer_delete(s_battery_timer);
+        s_battery_timer = NULL;
+    }
+    if (s_rtc_timer) {
+        lv_timer_delete(s_rtc_timer);
+        s_rtc_timer = NULL;
+    }
+    s_battery_icon = NULL;
+    s_battery_label = NULL;
+    s_time_label = NULL;
+    s_year_label = NULL;
+    s_month_label = NULL;
+    s_day_label = NULL;
+}
+
+static void create_battery_status(lv_obj_t *screen)
+{
+    lv_obj_t *status = lv_obj_create(screen);
+    lv_obj_remove_style_all(status);
+    lv_obj_set_size(status, CLOCK_DESKTOP_WIDTH, 56);
+    lv_obj_align(status, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_opa(status, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(status, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(status, clock_battery_delete_cb, LV_EVENT_DELETE, NULL);
+
+    lv_obj_t *battery_group = lv_obj_create(status);
+    lv_obj_remove_style_all(battery_group);
+    lv_obj_set_size(battery_group, 116, 56);
+    lv_obj_align(battery_group, LV_ALIGN_RIGHT_MID, -8, 0);
+    lv_obj_set_flex_flow(battery_group, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(battery_group, LV_FLEX_ALIGN_END,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(battery_group, 6, 0);
+    lv_obj_clear_flag(battery_group, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(battery_group, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    s_battery_icon = lv_label_create(battery_group);
+    lv_label_set_text(s_battery_icon, LV_SYMBOL_BATTERY_FULL);
+    lv_obj_set_style_text_font(s_battery_icon, &lv_font_montserrat_28, 0);
+    lv_obj_add_flag(s_battery_icon, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    s_battery_label = lv_label_create(battery_group);
+    lv_obj_set_style_text_color(s_battery_label,
+                                lv_color_hex(CLOCK_STATUS_TEXT_COLOR), 0);
+    lv_obj_set_style_text_font(s_battery_label, &lv_font_montserrat_28, 0);
+    lv_obj_add_flag(s_battery_label, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    clock_battery_update();
+
+    s_battery_timer = lv_timer_create(clock_battery_timer_cb,
+                                      CLOCK_BATTERY_REFRESH_MS,
+                                      NULL);
 }
 
 static void desktop_gesture_event_cb(lv_event_t *event)
@@ -63,157 +161,94 @@ static void desktop_gesture_event_cb(lv_event_t *event)
     }
 
     lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
-    if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT || dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
+    if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT ||
+        dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
         lv_obj_t *screen = lv_event_get_current_target(event);
-        clock_desktop_stop_timer();
         if (screen) {
             lv_obj_remove_event_cb(screen, desktop_gesture_event_cb);
         }
-        ui_nav_replace(ui_screen1_show);
+        ui_nav_replace(unlock_pin_ui_show);
     }
 }
 
-static lv_obj_t *create_text_line(lv_obj_t *parent,
-                                  const char *text,
-                                  const lv_font_t *font,
-                                  lv_color_t color,
-                                  int32_t y)
+static lv_obj_t *create_clock_label(lv_obj_t *parent,
+                                    const char *text,
+                                    const lv_font_t *font,
+                                    lv_color_t color,
+                                    int32_t x,
+                                    int32_t y,
+                                    int32_t scale)
 {
     lv_obj_t *label = lv_label_create(parent);
     lv_label_set_text(label, text);
-    lv_obj_set_width(label, CLOCK_DESKTOP_WIDTH - CLOCK_LEFT_MARGIN * 2);
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
-    lv_obj_set_style_text_color(label, color, 0);
     lv_obj_set_style_text_font(label, font, 0);
-    lv_obj_set_style_transform_scale(label, CLOCK_TEXT_SCALE, 0);
+    lv_obj_set_style_text_color(label, color, 0);
+    lv_obj_set_style_text_letter_space(label, 0, 0);
+    lv_obj_set_style_transform_scale(label, scale, 0);
     lv_obj_set_style_transform_pivot_x(label, 0, 0);
     lv_obj_set_style_transform_pivot_y(label, 0, 0);
-    lv_obj_align(label, LV_ALIGN_TOP_LEFT, CLOCK_LEFT_MARGIN, y);
+    lv_obj_set_pos(label, x, y);
     lv_obj_add_flag(label, LV_OBJ_FLAG_GESTURE_BUBBLE);
     return label;
 }
 
-static lv_obj_t *add_strip(lv_obj_t *parent, int32_t x, int32_t y, int32_t w, int32_t h, lv_color_t color, lv_opa_t opa)
-{
-    lv_obj_t *obj = lv_obj_create(parent);
-    lv_obj_remove_style_all(obj);
-    lv_obj_set_size(obj, w, h);
-    lv_obj_align(obj, LV_ALIGN_TOP_LEFT, x, y);
-    lv_obj_set_style_bg_color(obj, color, 0);
-    lv_obj_set_style_bg_opa(obj, opa, 0);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
-    lv_obj_add_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    return obj;
-}
-
-static void add_battery_icon(lv_obj_t *parent)
-{
-    lv_color_t accent = lv_color_hex(0x63E7FF);
-
-    lv_obj_t *body = lv_obj_create(parent);
-    lv_obj_remove_style_all(body);
-    lv_obj_set_size(body, 26, 12);
-    lv_obj_align(body, LV_ALIGN_TOP_RIGHT, -10, 8);
-    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_color(body, accent, 0);
-    lv_obj_set_style_border_width(body, 2, 0);
-    lv_obj_set_style_radius(body, 2, 0);
-    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
-    lv_obj_add_flag(body, LV_OBJ_FLAG_GESTURE_BUBBLE);
-
-    lv_obj_t *fill = lv_obj_create(body);
-    lv_obj_remove_style_all(fill);
-    lv_obj_set_size(fill, 16, 4);
-    lv_obj_align(fill, LV_ALIGN_LEFT_MID, 3, 0);
-    lv_obj_set_style_bg_color(fill, accent, 0);
-    lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(fill, 1, 0);
-    lv_obj_clear_flag(fill, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
-    lv_obj_add_flag(fill, LV_OBJ_FLAG_GESTURE_BUBBLE);
-
-    lv_obj_t *cap = lv_obj_create(parent);
-    lv_obj_remove_style_all(cap);
-    lv_obj_set_size(cap, 4, 6);
-    lv_obj_align_to(cap, body, LV_ALIGN_OUT_RIGHT_MID, 1, 0);
-    lv_obj_set_style_bg_color(cap, accent, 0);
-    lv_obj_set_style_bg_opa(cap, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(cap, 1, 0);
-    lv_obj_clear_flag(cap, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
-    lv_obj_add_flag(cap, LV_OBJ_FLAG_GESTURE_BUBBLE);
-}
-
-static void add_tech_lines(lv_obj_t *parent)
-{
-    lv_color_t cyan = lv_color_hex(0x63E7FF);
-    lv_color_t dim = lv_color_hex(0x17323A);
-    lv_color_t violet = lv_color_hex(0xA78BFA);
-
-    add_strip(parent, 22, 18, 96, 2, cyan, LV_OPA_COVER);
-    add_strip(parent, 22, 18, 2, 34, cyan, LV_OPA_COVER);
-    add_strip(parent, 376, 18, 60, 2, violet, LV_OPA_COVER);
-    add_strip(parent, 434, 18, 2, 24, violet, LV_OPA_COVER);
-
-    add_strip(parent, 22, 130, 180, 1, dim, LV_OPA_COVER);
-    add_strip(parent, 22, 168, 180, 1, dim, LV_OPA_COVER);
-    add_strip(parent, 22, 206, 180, 1, dim, LV_OPA_COVER);
-
-    add_strip(parent, 10, 136, 2, 356, cyan, LV_OPA_60);
-    add_strip(parent, 468, 136, 2, 356, violet, LV_OPA_40);
-
-    for (int32_t y = 254; y < 582; y += 64) {
-        add_strip(parent, 22, y, 308, 1, lv_color_hex(0x10242B), LV_OPA_COVER);
-    }
-}
-
-static void add_hint_text(lv_obj_t *parent)
-{
-    lv_obj_t *left = lv_label_create(parent);
-    lv_label_set_text(left, "LOCKED");
-    lv_obj_set_style_text_color(left, lv_color_hex(0x63E7FF), 0);
-    lv_obj_set_style_text_font(left, &lv_font_montserrat_14, 0);
-    lv_obj_align(left, LV_ALIGN_TOP_LEFT, 22, 22);
-    lv_obj_add_flag(left, LV_OBJ_FLAG_GESTURE_BUBBLE);
-
-    lv_obj_t *right = lv_label_create(parent);
-    lv_label_set_text(right, "SWIPE TO OPEN");
-    lv_obj_set_style_text_color(right, lv_color_hex(0x62707A), 0);
-    lv_obj_set_style_text_font(right, &lv_font_montserrat_14, 0);
-    lv_obj_align(right, LV_ALIGN_BOTTOM_RIGHT, -22, -18);
-    lv_obj_add_flag(right, LV_OBJ_FLAG_GESTURE_BUBBLE);
-}
-
 void ui_clock_desktop_show(void)
 {
-    clock_desktop_stop_timer();
-
     lv_obj_t *screen = lv_screen_active();
     lv_obj_clean(screen);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x061015), 0);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all(screen, 0, 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(screen, desktop_gesture_event_cb, LV_EVENT_GESTURE, NULL);
 
-    lv_obj_t *panel = lv_obj_create(screen);
-    lv_obj_remove_style_all(panel);
-    lv_obj_set_size(panel, CLOCK_DESKTOP_WIDTH, CLOCK_DESKTOP_HEIGHT);
-    lv_obj_align(panel, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(panel, lv_color_hex(0x061015), 0);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
-    lv_obj_add_flag(panel, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_t *content = lv_obj_create(screen);
+    lv_obj_remove_style_all(content);
+    lv_obj_set_size(content, CLOCK_DESKTOP_WIDTH, CLOCK_DESKTOP_HEIGHT);
+    lv_obj_align(content, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(content, lv_color_hex(0x0D1117), 0);
+    lv_obj_set_style_bg_opa(content, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_add_flag(content, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
-    add_tech_lines(panel);
-    add_battery_icon(panel);
-    add_hint_text(panel);
+    setup_lock_clock_mode_t mode = setup_ui_get_lock_clock_mode();
+    int32_t time_y = CLOCK_TIME_Y;
+    if (mode == SETUP_LOCK_CLOCK_HM_MD) {
+        time_y = CLOCK_HM_MD_TIME_Y;
+    } else if (mode == SETUP_LOCK_CLOCK_HM) {
+        time_y = CLOCK_HM_TIME_Y;
+    }
 
-    s_clock_labels.time = create_text_line(panel, "00:00", &lv_font_montserrat_48,
-                                           lv_color_hex(0xF4FBFF), 36);
-    s_clock_labels.year = create_text_line(panel, "1970", &lv_font_montserrat_48,
-                                           lv_color_hex(0xA9B6BE), 176);
-    s_clock_labels.month = create_text_line(panel, "01", &lv_font_montserrat_48,
-                                            lv_color_hex(0x7E8A92), 316);
-    s_clock_labels.day = create_text_line(panel, "01", &lv_font_montserrat_48,
-                                          lv_color_hex(0x67737B), 456);
+    if (mode != SETUP_LOCK_CLOCK_OFF) {
+        s_time_label = create_clock_label(content, "--:--", &font_clock_96,
+                                          lv_color_hex(0xF5F5F5),
+                                          CLOCK_LEFT_MARGIN, time_y, CLOCK_TIME_SCALE);
+    }
+    if (mode == SETUP_LOCK_CLOCK_HM_YMD) {
+        s_year_label = create_clock_label(content, "----", &font_clock_96,
+                                          lv_color_hex(0x747474),
+                                          CLOCK_LEFT_MARGIN, CLOCK_YEAR_Y, CLOCK_YEAR_SCALE);
+        s_month_label = create_clock_label(content, "--", &font_clock_96,
+                                           lv_color_hex(0xA0A0A0),
+                                           CLOCK_LEFT_MARGIN, CLOCK_MONTH_Y, CLOCK_DATE_SCALE);
+        s_day_label = create_clock_label(content, "--", &font_clock_96,
+                                         lv_color_hex(0xA0A0A0),
+                                         CLOCK_LEFT_MARGIN, CLOCK_DAY_Y, CLOCK_DATE_SCALE);
+    } else if (mode == SETUP_LOCK_CLOCK_HM_MD) {
+        s_month_label = create_clock_label(content, "--", &font_clock_96,
+                                           lv_color_hex(0xA0A0A0),
+                                           CLOCK_LEFT_MARGIN, CLOCK_HM_MD_MONTH_Y,
+                                           CLOCK_DATE_SCALE);
+        s_day_label = create_clock_label(content, "--", &font_clock_96,
+                                         lv_color_hex(0xA0A0A0),
+                                         CLOCK_LEFT_MARGIN, CLOCK_HM_MD_DAY_Y,
+                                         CLOCK_DATE_SCALE);
+    }
 
-    clock_desktop_update();
-    s_clock_timer = lv_timer_create(clock_timer_cb, 1000, NULL);
+    if (s_time_label) {
+        clock_rtc_update();
+        s_rtc_timer = lv_timer_create(clock_rtc_timer_cb, CLOCK_RTC_REFRESH_MS, NULL);
+    }
+
+    create_battery_status(screen);
 }

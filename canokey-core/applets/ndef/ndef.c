@@ -10,6 +10,21 @@
 #define NDEF_MSG_MAX_LENGTH 1022
 #define NDEF_FILE_MAX_LENGTH (NDEF_MSG_MAX_LENGTH + 2)
 #define CC_LENGTH 15
+#ifndef NDEF_DEFAULT_EMPTY
+#define NDEF_DEFAULT_EMPTY 0
+#endif
+
+static const uint8_t previous_default_ndef[] = {
+    0x00, 0x11, 0xD1, 0x01, 0x0D, 0x55, 0x04,
+    'c', 'a', 'n', 'o', 'k', 'e', 'y', 's', '.', 'o', 'r', 'g',
+};
+
+#if !NDEF_DEFAULT_EMPTY
+static const uint8_t default_ndef[] = {
+    0x00, 0x10, 0xD1, 0x01, 0x0C, 0x55, 0x04,
+    'm', 'i', 'i', 'x', 'p', 'r', 'o', '.', 'c', 'o', 'm',
+};
+#endif
 
 static uint8_t current_cc[CC_LENGTH];
 static const uint8_t default_cc[CC_LENGTH] = {
@@ -73,9 +88,14 @@ int ndef_toggle_read_only(const CAPDU *capdu, RAPDU *rapdu) {
 }
 
 int ndef_create_init_ndef() {
-  const char *init_data = "\x00\x11\xD1\x01\x0D\x55\x04"
-                          "canokeys.org";
-  if (write_file(NDEF_FILE, init_data, 0, 19, 1) < 0) return -1;
+#if NDEF_DEFAULT_EMPTY
+  static const uint8_t init_data[] = {0x00, 0x00};
+  const size_t init_data_len = sizeof(init_data);
+#else
+  const uint8_t *init_data = default_ndef;
+  const size_t init_data_len = sizeof(default_ndef);
+#endif
+  if (write_file(NDEF_FILE, init_data, 0, init_data_len, 1) < 0) return -1;
   if (truncate_file(NDEF_FILE, NDEF_FILE_MAX_LENGTH) < 0) return -1; // Fill the file with zeros
   return 0;
 }
@@ -88,6 +108,17 @@ int ndef_install(const uint8_t reset) {
     if (write_file(CC_FILE, &current_cc, 0, sizeof(current_cc), 1) < 0) return -1;
   } else {
     if (read_file(CC_FILE, &current_cc, 0, sizeof(current_cc)) < 0) return -1;
+    uint8_t existing_default[sizeof(previous_default_ndef)];
+    if (read_file(NDEF_FILE, existing_default, 0, sizeof(existing_default)) < 0) return -1;
+    const bool previous_default =
+        memcmp(existing_default, previous_default_ndef, sizeof(existing_default)) == 0;
+#if NDEF_DEFAULT_EMPTY
+    if (previous_default && ndef_create_init_ndef() < 0)
+#else
+    const bool empty_default = existing_default[0] == 0 && existing_default[1] == 0;
+    if ((previous_default || empty_default) && ndef_create_init_ndef() < 0)
+#endif
+      return -1;
     // should check sanity, by standard
   }
   return 0;

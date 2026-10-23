@@ -1,7 +1,9 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "canokey_esp32p4.h"
+#include "canokey_nfc.h"
 #include "device.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -13,17 +15,30 @@
 
 static const char *TAG = "ui_fido";
 static lv_obj_t *s_dialog;
-static bool s_dialog_pending;
 static uint8_t s_dialog_cbor_cmd;
+static uint8_t s_dialog_entry;
+static uint32_t s_dialog_nfc_token;
 static QueueHandle_t s_fido_ui_queue;
 static lv_timer_t *s_fido_ui_timer;
+static atomic_bool s_dialog_busy;
+static bool s_dialog_resolved;
 
 typedef enum {
     FIDO_UI_CMD_SHOW_CONFIRM,
 } fido_ui_cmd_t;
 
-static const char *fido_confirm_title(uint8_t cbor_cmd)
+typedef struct {
+    fido_ui_cmd_t command;
+    uint8_t entry;
+    uint8_t cbor_cmd;
+    uint32_t nfc_token;
+} fido_ui_request_t;
+
+static const char *confirm_title(uint8_t entry, uint8_t cbor_cmd)
 {
+    if (entry == WAIT_ENTRY_CCID) {
+        return "Smart Card Confirmation";
+    }
     switch (cbor_cmd) {
     case 0x01:
         return "FIDO Registration";
@@ -36,8 +51,11 @@ static const char *fido_confirm_title(uint8_t cbor_cmd)
     }
 }
 
-static const char *fido_confirm_message(uint8_t cbor_cmd)
+static const char *confirm_message(uint8_t entry, uint8_t cbor_cmd)
 {
+    if (entry == WAIT_ENTRY_CCID) {
+        return "Confirm the smart card operation";
+    }
     switch (cbor_cmd) {
     case 0x01:
         return "Create a new passkey";
@@ -50,14 +68,38 @@ static const char *fido_confirm_message(uint8_t cbor_cmd)
     }
 }
 
+static void submit_dialog_result(uint8_t result)
+{
+    if (s_dialog_entry == CANOKEY_NFC_WAIT_ENTRY) {
+        canokey_nfc_submit_user_presence(s_dialog_nfc_token, result);
+    } else {
+        set_touch_result(result);
+    }
+}
+
+static void dialog_delete_event_cb(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_DELETE &&
+        lv_event_get_target(event) == s_dialog) {
+        if (!s_dialog_resolved && (s_dialog_entry != CANOKEY_NFC_WAIT_ENTRY ||
+            (canokey_nfc_user_presence_pending() && s_dialog_nfc_token == canokey_nfc_presence_token()))) {
+            s_dialog_resolved = true;
+            submit_dialog_result(TOUCH_CANCEL);
+            ESP_LOGW(TAG, "User-presence dialog closed before confirmation");
+        }
+        s_dialog = NULL;
+        atomic_store_explicit(&s_dialog_busy, false, memory_order_release);
+    }
+}
+
 static void close_dialog(void)
 {
     if (s_dialog) {
-        ESP_LOGI(TAG, "close FIDO confirm dialog");
-        lv_obj_delete(s_dialog);
-        s_dialog = NULL;
+        ESP_LOGI(TAG, "close user-presence dialog");
+        lv_obj_delete_async(s_dialog);
+    } else {
+        atomic_store_explicit(&s_dialog_busy, false, memory_order_release);
     }
-    s_dialog_pending = false;
 }
 
 static void confirm_event_cb(lv_event_t *event)
@@ -65,9 +107,16 @@ static void confirm_event_cb(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
         return;
     }
+    if (s_dialog_resolved) {
+        return;
+    }
 
-    set_touch_result(TOUCH_SHORT);
-    ESP_LOGW(TAG, "FIDO user presence confirmed: set TOUCH_SHORT");
+    s_dialog_resolved = true;
+    if (s_dialog_entry != CANOKEY_NFC_WAIT_ENTRY ||
+        (canokey_nfc_user_presence_pending() && s_dialog_nfc_token == canokey_nfc_presence_token())) {
+        submit_dialog_result(TOUCH_SHORT);
+    }
+    ESP_LOGW(TAG, "User presence confirmed");
     close_dialog();
 }
 
@@ -76,8 +125,16 @@ static void cancel_event_cb(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
         return;
     }
+    if (s_dialog_resolved) {
+        return;
+    }
 
-    ESP_LOGW(TAG, "FIDO user presence canceled by UI");
+    s_dialog_resolved = true;
+    if (s_dialog_entry != CANOKEY_NFC_WAIT_ENTRY ||
+        (canokey_nfc_user_presence_pending() && s_dialog_nfc_token == canokey_nfc_presence_token())) {
+        submit_dialog_result(TOUCH_CANCEL);
+    }
+    ESP_LOGW(TAG, "User presence canceled by UI");
     close_dialog();
 }
 
@@ -98,7 +155,7 @@ static lv_obj_t *add_button(lv_obj_t *parent, const char *text, lv_align_t align
     return button;
 }
 
-static void show_fido_confirm_ui(void)
+static void show_confirm_ui(uint8_t entry, uint8_t cbor_cmd)
 {
     if (s_dialog) {
         ESP_LOGW(TAG, "skip FIDO confirm dialog: already visible");
@@ -108,12 +165,20 @@ static void show_fido_confirm_ui(void)
     lv_obj_t *screen = lv_screen_active();
     if (!screen) {
         ESP_LOGE(TAG, "cannot show FIDO confirm dialog: no active screen");
-        s_dialog_pending = false;
+        atomic_store_explicit(&s_dialog_busy, false, memory_order_release);
         return;
     }
 
-    ESP_LOGW(TAG, "show FIDO confirm dialog");
+    s_dialog_cbor_cmd = cbor_cmd;
+    s_dialog_entry = entry;
+    s_dialog_resolved = false;
+    ESP_LOGW(TAG, "show user-presence dialog entry=%u", entry);
     s_dialog = lv_obj_create(screen);
+    if (!s_dialog) {
+        atomic_store_explicit(&s_dialog_busy, false, memory_order_release);
+        return;
+    }
+    lv_obj_add_event_cb(s_dialog, dialog_delete_event_cb, LV_EVENT_DELETE, NULL);
     lv_obj_set_size(s_dialog, FIDO_CONFIRM_WIDTH, FIDO_CONFIRM_HEIGHT);
     lv_obj_center(s_dialog);
     lv_obj_set_style_bg_color(s_dialog, lv_color_hex(0x20232B), 0);
@@ -125,13 +190,13 @@ static void show_fido_confirm_ui(void)
     lv_obj_add_flag(s_dialog, LV_OBJ_FLAG_FLOATING);
 
     lv_obj_t *title = lv_label_create(s_dialog);
-    lv_label_set_text(title, fido_confirm_title(s_dialog_cbor_cmd));
+    lv_label_set_text(title, confirm_title(s_dialog_entry, s_dialog_cbor_cmd));
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 4, 2);
 
     lv_obj_t *message = lv_label_create(s_dialog);
-    lv_label_set_text(message, fido_confirm_message(s_dialog_cbor_cmd));
+    lv_label_set_text(message, confirm_message(s_dialog_entry, s_dialog_cbor_cmd));
     lv_obj_set_width(message, FIDO_CONFIRM_WIDTH - 44);
     lv_obj_set_style_text_color(message, lv_color_hex(0xD8DCE6), 0);
     lv_obj_set_style_text_font(message, &lv_font_montserrat_28, 0);
@@ -143,8 +208,7 @@ static void show_fido_confirm_ui(void)
     lv_obj_t *confirm = add_button(s_dialog, "Confirm", LV_ALIGN_BOTTOM_RIGHT, -4, lv_color_hex(0x5D6CFF));
     lv_obj_add_event_cb(confirm, confirm_event_cb, LV_EVENT_CLICKED, NULL);
 
-    s_dialog_pending = false;
-    ESP_LOGI(TAG, "FIDO confirm dialog ready");
+    ESP_LOGI(TAG, "User-presence dialog ready");
 }
 
 static void fido_ui_timer_cb(lv_timer_t *timer)
@@ -155,22 +219,47 @@ static void fido_ui_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    fido_ui_cmd_t cmd;
-    while (xQueueReceive(s_fido_ui_queue, &cmd, 0) == pdTRUE) {
-        if (cmd == FIDO_UI_CMD_SHOW_CONFIRM) {
-            show_fido_confirm_ui();
+    if (s_dialog && s_dialog_entry == CANOKEY_NFC_WAIT_ENTRY &&
+        (!canokey_nfc_user_presence_pending() || s_dialog_nfc_token != canokey_nfc_presence_token())) {
+        s_dialog_resolved = true;
+        lv_obj_delete(s_dialog);
+    }
+
+    fido_ui_request_t request;
+    while (xQueueReceive(s_fido_ui_queue, &request, 0) == pdTRUE) {
+        if (request.command == FIDO_UI_CMD_SHOW_CONFIRM) {
+            if (request.entry == CANOKEY_NFC_WAIT_ENTRY &&
+                (!canokey_nfc_user_presence_pending() || request.nfc_token != canokey_nfc_presence_token())) {
+                atomic_store_explicit(&s_dialog_busy, false, memory_order_release);
+                continue;
+            }
+            if (request.entry == CANOKEY_NFC_WAIT_ENTRY && s_dialog &&
+                (s_dialog_entry != CANOKEY_NFC_WAIT_ENTRY || s_dialog_nfc_token != request.nfc_token)) {
+                s_dialog_resolved = true;
+                lv_obj_delete(s_dialog);
+            }
+            s_dialog_nfc_token = request.nfc_token;
+            atomic_store_explicit(&s_dialog_busy, true, memory_order_release);
+            show_confirm_ui(request.entry, request.cbor_cmd);
         }
     }
 }
 
-static bool post_fido_ui_cmd(fido_ui_cmd_t cmd)
+static bool post_fido_ui_cmd(fido_ui_cmd_t command, uint8_t entry,
+                             uint8_t cbor_cmd)
 {
     if (!s_fido_ui_queue) {
         ESP_LOGW(TAG, "FIDO UI queue is not ready");
         return false;
     }
 
-    if (xQueueSend(s_fido_ui_queue, &cmd, 0) != pdTRUE) {
+    const fido_ui_request_t request = {
+        .command = command,
+        .entry = entry,
+        .cbor_cmd = cbor_cmd,
+        .nfc_token = entry == CANOKEY_NFC_WAIT_ENTRY ? canokey_nfc_presence_token() : 0,
+    };
+    if (xQueueSend(s_fido_ui_queue, &request, 0) != pdTRUE) {
         ESP_LOGW(TAG, "FIDO UI queue full");
         return false;
     }
@@ -180,35 +269,43 @@ static bool post_fido_ui_cmd(fido_ui_cmd_t cmd)
 
 static void ui_fido_confirm_request(uint8_t entry)
 {
-    ESP_LOGW(TAG, "user presence request entry=%u dialog=%u pending=%u",
+    ESP_LOGW(TAG, "user presence request entry=%u busy=%u",
              entry,
-             s_dialog ? 1 : 0,
-             s_dialog_pending ? 1 : 0);
+             atomic_load_explicit(&s_dialog_busy, memory_order_acquire) ? 1 : 0);
 
-    if (entry != WAIT_ENTRY_CTAPHID) {
+    if (entry != WAIT_ENTRY_CTAPHID && entry != WAIT_ENTRY_CCID && entry != CANOKEY_NFC_WAIT_ENTRY) {
         ESP_LOGW(TAG, "ignore user presence request: unsupported entry=%u", entry);
         return;
     }
 
-    if (s_dialog || s_dialog_pending) {
-        ESP_LOGW(TAG, "ignore user presence request: dialog already active");
-        return;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&s_dialog_busy,
+                                                  &expected,
+                                                  true,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+        if (entry != CANOKEY_NFC_WAIT_ENTRY) {
+            ESP_LOGW(TAG, "ignore user presence request: dialog already active");
+            return;
+        }
     }
 
-    s_dialog_cbor_cmd = canokey_esp32p4_get_current_ctap_cbor_cmd();
-    s_dialog_pending = true;
-    ESP_LOGI(TAG, "schedule FIDO confirm dialog cmd=0x%02x title=%s",
-             s_dialog_cbor_cmd,
-             fido_confirm_title(s_dialog_cbor_cmd));
-    if (!post_fido_ui_cmd(FIDO_UI_CMD_SHOW_CONFIRM)) {
-        s_dialog_pending = false;
+    uint8_t cbor_cmd = entry == WAIT_ENTRY_CTAPHID
+                           ? canokey_esp32p4_get_current_ctap_cbor_cmd()
+                           : (entry == CANOKEY_NFC_WAIT_ENTRY ? canokey_nfc_current_cbor_cmd() : 0);
+    ESP_LOGI(TAG, "schedule confirm dialog entry=%u cmd=0x%02x title=%s",
+              entry,
+              cbor_cmd,
+              confirm_title(entry, cbor_cmd));
+    if (!post_fido_ui_cmd(FIDO_UI_CMD_SHOW_CONFIRM, entry, cbor_cmd)) {
+        atomic_store_explicit(&s_dialog_busy, false, memory_order_release);
     }
 }
 
 void ui_fido_confirm_init(void)
 {
     if (!s_fido_ui_queue) {
-        s_fido_ui_queue = xQueueCreate(4, sizeof(fido_ui_cmd_t));
+        s_fido_ui_queue = xQueueCreate(4, sizeof(fido_ui_request_t));
         if (!s_fido_ui_queue) {
             ESP_LOGW(TAG, "Failed to create FIDO UI queue");
             return;

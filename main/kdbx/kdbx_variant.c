@@ -5,11 +5,15 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "kdbx";
+
+#define KDBX_WDT_RESET_INTERVAL_US  15000
+#define KDBX_IDLE_RUN_INTERVAL_US   100000
 
 uint32_t kdbx_read_le32(const uint8_t *buf)
 {
@@ -40,8 +44,22 @@ static void write_le64(uint8_t out[8], uint64_t value)
 
 void kdbx_crypto_cooperate(void)
 {
-    taskYIELD();
-    vTaskDelay(1);
+    static int64_t last_wdt_reset_us;
+    static int64_t last_idle_release_us;
+    int64_t now_us = esp_timer_get_time();
+
+    if (now_us - last_wdt_reset_us >= KDBX_WDT_RESET_INTERVAL_US) {
+        last_wdt_reset_us = now_us;
+        if (esp_task_wdt_status(NULL) == ESP_OK) {
+            esp_task_wdt_reset();
+        }
+    }
+
+    if (now_us - last_idle_release_us >= KDBX_IDLE_RUN_INTERVAL_US) {
+        last_idle_release_us = now_us;
+        /* taskYIELD() cannot run the lower-priority IDLE task watched by TWDT. */
+        vTaskDelay(1);
+    }
 }
 
 void kdbx_log_hex_value(const char *label, const uint8_t *data, size_t len)
@@ -74,7 +92,7 @@ int64_t kdbx_now_us(void)
 void kdbx_log_elapsed(const char *label, int64_t start_us)
 {
     int64_t elapsed_us = esp_timer_get_time() - start_us;
-    ESP_LOGI(TAG, "KDBX timing: %s took %lld us (%lld ms)",
+    KDBX_LOGD(TAG, "KDBX timing: %s took %lld us (%lld ms)",
              label,
              (long long)elapsed_us,
              (long long)(elapsed_us / 1000));
@@ -188,33 +206,43 @@ esp_err_t kdbx_header_hmac(const uint8_t hmac_base_key[64],
     return kdbx_hmac_sha256(header_key, sizeof(header_key), header_bytes, header_len, out_hmac);
 }
 
-void kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *header)
+esp_err_t kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *header)
 {
     if (len < 2) {
         ESP_LOGW(TAG, "KDF parameters too short: %u", (unsigned int)len);
-        return;
+        return ESP_ERR_INVALID_SIZE;
     }
 
     uint16_t version = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+    if (version != 0x0100) {
+        ESP_LOGW(TAG, "Unsupported KDF parameters version=0x%04x", version);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     size_t offset = 2;
-    ESP_LOGI(TAG, "KDF parameters version=0x%04x", version);
+    KDBX_LOGD(TAG, "KDF parameters version=0x%04x", version);
 
     while (offset < len) {
         uint8_t value_type = data[offset++];
         if (value_type == 0) {
-            ESP_LOGI(TAG, "KDF parameters end");
-            return;
+            KDBX_LOGD(TAG, "KDF parameters end");
+            if (offset != len) {
+                ESP_LOGW(TAG, "KDF parameters contain %u trailing bytes",
+                         (unsigned int)(len - offset));
+                return ESP_ERR_INVALID_SIZE;
+            }
+            return ESP_OK;
         }
 
-        if (offset + 4 > len) {
+        if (len - offset < 4) {
             ESP_LOGW(TAG, "KDF parameter truncated before key length");
-            return;
+            return ESP_ERR_INVALID_SIZE;
         }
         uint32_t key_len = kdbx_read_le32(data + offset);
         offset += 4;
-        if (offset + key_len + 4 > len || key_len >= 32) {
+        if (key_len >= 32 || key_len > len - offset || len - offset - key_len < 4) {
             ESP_LOGW(TAG, "KDF parameter invalid key length=%lu", (unsigned long)key_len);
-            return;
+            return ESP_ERR_INVALID_SIZE;
         }
 
         char key[32];
@@ -224,9 +252,9 @@ void kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *h
 
         uint32_t value_len = kdbx_read_le32(data + offset);
         offset += 4;
-        if (offset + value_len > len) {
+        if (value_len > len - offset) {
             ESP_LOGW(TAG, "KDF parameter '%s' truncated value length=%lu", key, (unsigned long)value_len);
-            return;
+            return ESP_ERR_INVALID_SIZE;
         }
 
         const uint8_t *value = data + offset;
@@ -239,7 +267,7 @@ void kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *h
         } else if (strcmp(key, "R") == 0 && (value_type == 0x05 || value_type == 0x0d) && value_len == 8) {
             header->kdf_rounds = kdbx_read_le64(value);
             header->has_kdf_rounds = true;
-            ESP_LOGI(TAG, "KDBX AES-KDF rounds=%llu", (unsigned long long)header->kdf_rounds);
+            KDBX_LOGD(TAG, "KDBX AES-KDF rounds=%llu", (unsigned long long)header->kdf_rounds);
         }
 
 #if KDBX_VERBOSE_LOG
@@ -274,4 +302,7 @@ void kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *h
 
         offset += value_len;
     }
+
+    ESP_LOGW(TAG, "KDF parameters missing end marker");
+    return ESP_ERR_INVALID_SIZE;
 }

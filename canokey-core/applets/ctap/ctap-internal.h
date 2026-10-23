@@ -11,6 +11,8 @@
 
 #define FIRMWARE_VERSION 201
 #define CTAP_MAX_MSG_SIZE MAX_CTAP_BUFSIZE
+#define CTAP_GET_INFO_MAX_MSG_SIZE 1300
+#define CTAP_GET_INFO_MAX_CBOR_SIZE 256
 
 // Filesystem Meta
 // clang-format off
@@ -270,7 +272,7 @@
   (1 + sizeof("credBlob") + 1 + sizeof("credProtect") + 1 + sizeof("hmac-secret") + 1 +                            \
    sizeof("hmac-secret-mc") + 2 + MAX_HMAC_SECRET_OUTPUT_IN_AUTH + sizeof("minPinLength") + 2 +                     \
    sizeof("thirdPartyPayment") + 1)
-#define MAX_CREDENTIAL_COUNT_IN_LIST  16
+#define MAX_CREDENTIAL_COUNT_IN_LIST  8
 #define MAX_CRED_BLOB_LENGTH          32
 #define LARGE_BLOB_KEY_SIZE           32
 #define LARGE_BLOB_SIZE_LIMIT         4096

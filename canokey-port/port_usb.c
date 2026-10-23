@@ -5,6 +5,7 @@
 #include "usbd_ctaphid.h"
 
 #include "canokey_esp32p4.h"
+#include "canokey_nfc.h"
 #include "class/hid/hid_device.h"
 #include "ctaphid.h"
 #include "device.h"
@@ -341,20 +342,6 @@ static bool debug_cbor_read_bool(const uint8_t *buf, size_t len, size_t *offset,
     return false;
 }
 
-static bool debug_cbor_read_bool_with_location(uint8_t *buf,
-                                               size_t len,
-                                               size_t *offset,
-                                               bool *value,
-                                               size_t *value_offset)
-{
-    if (*offset >= len) {
-        return false;
-    }
-
-    *value_offset = *offset;
-    return debug_cbor_read_bool(buf, len, offset, value);
-}
-
 static bool debug_cbor_read_int_with_location(uint8_t *buf,
                                               size_t len,
                                               size_t *offset,
@@ -394,68 +381,15 @@ static void patch_make_credential_pub_key_algs(uint8_t *buf, size_t len)
     }
 
     unsigned patched = 0;
-    bool rk_seen = false;
-    bool rk_patched = false;
     for (uint64_t i = 0; i < map_items; i++) {
         uint64_t key = 0;
         if (!debug_cbor_read_uint_key(buf, len, &offset, &key)) {
             return;
         }
 
-        if (key != 4 && key != 7) {
+        if (key != 4) {
             if (!debug_cbor_skip(buf, len, &offset)) {
                 return;
-            }
-            continue;
-        }
-
-        if (key == 7) {
-            uint64_t option_count = 0;
-            if (!debug_cbor_read_ai(buf, len, &offset, 5, &option_count)) {
-                return;
-            }
-
-            for (uint64_t j = 0; j < option_count; j++) {
-                const uint8_t *name = NULL;
-                uint64_t name_len = 0;
-                if (!debug_cbor_read_text_string_header(buf, len, &offset, &name, &name_len)) {
-                    return;
-                }
-
-                if (name_len == 2 && memcmp(name, "rk", 2) == 0) {
-                    bool value = false;
-                    size_t value_offset = 0;
-                    if (!debug_cbor_read_bool_with_location(buf, len, &offset, &value, &value_offset)) {
-                        return;
-                    }
-                    rk_seen = true;
-                    ESP_LOGW(TAG, "CTAP makeCredential options.rk=%u", value ? 1 : 0);
-                    if (!value && buf[value_offset] == 0xF4) {
-                        buf[value_offset] = 0xF5;
-                        rk_patched = true;
-                        ESP_LOGW(TAG, "CTAP makeCredential force options.rk false -> true at offset=%u",
-                                 (unsigned)value_offset);
-                    }
-                } else if (!rk_seen && name_len == 2 && memcmp(name, "up", 2) == 0) {
-                    bool value = false;
-                    size_t value_offset = 0;
-                    if (!debug_cbor_read_bool_with_location(buf, len, &offset, &value, &value_offset)) {
-                        return;
-                    }
-                    ESP_LOGW(TAG, "CTAP makeCredential options.up=%u", value ? 1 : 0);
-                    if (value) {
-                        uint8_t *mutable_name = (uint8_t *)name;
-                        mutable_name[0] = 'r';
-                        mutable_name[1] = 'k';
-                        rk_seen = true;
-                        rk_patched = true;
-                        ESP_LOGW(TAG, "CTAP makeCredential force options.up=true key -> rk=true");
-                    }
-                } else {
-                    if (!debug_cbor_skip(buf, len, &offset)) {
-                        return;
-                    }
-                }
             }
             continue;
         }
@@ -504,11 +438,6 @@ static void patch_make_credential_pub_key_algs(uint8_t *buf, size_t len)
 
     if (patched == 0) {
         ESP_LOGW(TAG, "CTAP makeCredential alg patch: no EdDSA(-8) entry changed");
-    }
-    if (!rk_seen) {
-        ESP_LOGW(TAG, "CTAP makeCredential rk patch: rk option absent and no up=true field to reuse");
-    } else if (!rk_patched) {
-        ESP_LOGW(TAG, "CTAP makeCredential rk patch: rk already true");
     }
 }
 
@@ -982,6 +911,17 @@ void USBD_CTAPHID_ServiceReceive(void)
     while (xQueueReceive(s_ctaphid_event_queue, &event, 0) == pdTRUE) {
         switch (event.type) {
         case CANOKEY_CTAPHID_EVENT_OUT:
+            if (canokey_nfc_is_active()) {
+                /* Report busy for new USB commands; ignore their continuation
+                 * frames so they cannot overwrite the NFC request buffers. */
+                if (event.report[4] & TYPE_INIT) {
+                    uint32_t cid;
+                    memcpy(&cid, event.report, sizeof(cid));
+                    const uint8_t error = ERR_CHANNEL_BUSY;
+                    CTAPHID_SendResponseAuto(cid, CTAPHID_ERROR, &error, sizeof(error));
+                }
+                break;
+            }
             {
                 uint8_t raw_cmd = event.report[4];
                 if ((raw_cmd & 0x80) != 0) {

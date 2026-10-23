@@ -9,8 +9,25 @@
 #include "kdbx_loader.h"
 #include "mbedtls/md.h"
 
-#define KDBX_MAX_ENTRIES 24
+#define KDBX_MAX_ENTRIES                4096U
+#define KDBX_MAX_ENTRIES_PER_GROUP      1024U
+#define KDBX_MAX_GROUPS                 128U
+#define KDBX_MAX_KDF_ROUNDS             1000000ULL
+#define KDBX_MAX_FILE_SIZE              (4U * 1024U * 1024U)
+#define KDBX_MAX_HEADER_FIELD_SIZE      (64U * 1024U)
+#define KDBX_MAX_HMAC_BLOCK_SIZE        KDBX_MAX_FILE_SIZE
+#define KDBX_MAX_ENCRYPTED_PAYLOAD_SIZE KDBX_MAX_FILE_SIZE
+#define KDBX_MAX_XML_SIZE               (8U * 1024U * 1024U)
+#define KDBX_DEBUG_LOG   0
 #define KDBX_VERBOSE_LOG 0
+/* Debug only: decrypted XML contains sensitive credential metadata. */
+#define KDBX_DUMP_DECRYPTED_XML 0
+
+#if KDBX_DEBUG_LOG
+#define KDBX_LOGD(tag, format, ...) ESP_LOGI(tag, format, ##__VA_ARGS__)
+#else
+#define KDBX_LOGD(tag, format, ...) ESP_LOGD(tag, format, ##__VA_ARGS__)
+#endif
 
 typedef struct {
     uint8_t cipher_id[16];
@@ -20,6 +37,7 @@ typedef struct {
     uint8_t master_seed[32];
     bool has_master_seed;
     uint8_t encryption_iv[16];
+    size_t encryption_iv_len;
     bool has_encryption_iv;
     uint8_t kdf_uuid[16];
     bool has_kdf_uuid;
@@ -27,6 +45,7 @@ typedef struct {
     bool has_kdf_seed;
     uint64_t kdf_rounds;
     bool has_kdf_rounds;
+    bool has_public_custom_data;
 } kdbx_header_t;
 
 typedef struct {
@@ -42,6 +61,10 @@ void kdbx_log_hex_value(const char *label, const uint8_t *data, size_t len);
 int64_t kdbx_now_us(void);
 void kdbx_log_elapsed(const char *label, int64_t start_us);
 void kdbx_crypto_cooperate(void);
+void kdbx_publish_entry_count(size_t count);
+void kdbx_reset_groups(void);
+size_t kdbx_add_group(const char *name, uint8_t depth, size_t parent_index);
+bool kdbx_try_increment_group_entry_count(size_t index);
 
 esp_err_t kdbx_sha256_bytes(const uint8_t *data, size_t len, uint8_t out[32]);
 esp_err_t kdbx_sha512_bytes(const uint8_t *data, size_t len, uint8_t out[64]);
@@ -53,7 +76,7 @@ esp_err_t kdbx_header_hmac(const uint8_t hmac_base_key[64],
                            size_t header_len,
                            uint8_t out_hmac[32]);
 
-void kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *header);
+esp_err_t kdbx_parse_kdf_parameters(const uint8_t *data, size_t len, kdbx_header_t *header);
 esp_err_t kdbx_derive_aes_kdf_master_key(const kdbx_header_t *header,
                                          const char *password,
                                          uint8_t master_key[32],

@@ -48,6 +48,7 @@ if(CANOKEY_VENDOR_DEPS_READY)
                     "${CANOKEY_DIR}/applets/ctap/ctap-internal.h"
                     "${CANOKEY_DIR}/applets/ctap/cose-key.h"
                 --credential-id-size 70
+                --attestation-format none
                 --output "${CANOKEY_GENERATED_DIR}/ctap_get_info_cbor.inc"
             RESULT_VARIABLE CANOKEY_GEN_CTAP_RESULT
         )
@@ -62,11 +63,13 @@ if(CANOKEY_VENDOR_DEPS_READY)
         "${CANOKEY_DIR}/src/*.c"
         "${CANOKEY_DIR}/applets/admin/*.c"
         "${CANOKEY_DIR}/applets/ctap/*.c"
+        "${CANOKEY_DIR}/applets/ndef/*.c"
         "${CANOKEY_DIR}/applets/oath/*.c"
         "${CANOKEY_DIR}/applets/openpgp/*.c"
         "${CANOKEY_DIR}/applets/pass/*.c"
         "${CANOKEY_DIR}/applets/piv/*.c"
         "${CANOKEY_DIR}/interfaces/USB/class/ctaphid/ctaphid.c"
+        "${CANOKEY_DIR}/interfaces/NFC/nfc.c"
         "${CANOKEY_DIR}/littlefs/lfs.c"
         "${CANOKEY_DIR}/littlefs/lfs_util.c"
         "${CANOKEY_DIR}/tinycbor/src/cborencoder.c"
@@ -75,7 +78,7 @@ if(CANOKEY_VENDOR_DEPS_READY)
     )
 else()
     message(WARNING "CanoKey vendored submodules are missing; building canokey_core placeholder only")
-    set(CANOKEY_CORE_SRCS "canokey_esp32p4_port.c" "port_usb.c" "port_flash.c" "port_crypto.c" "${CMAKE_CURRENT_LIST_DIR}/port_ui.c" "${CMAKE_CURRENT_LIST_DIR}/canokey_core_placeholder.c")
+    set(CANOKEY_CORE_SRCS "port_nfc.c" "canokey_esp32p4_port.c" "port_usb.c" "port_flash.c" "port_crypto.c" "${CMAKE_CURRENT_LIST_DIR}/port_ui.c" "${CMAKE_CURRENT_LIST_DIR}/canokey_core_placeholder.c")
 endif()
 
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/canokey_esp32p4_port.c")
@@ -88,6 +91,7 @@ list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_random.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_time.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_ui.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_usb.c")
+list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/port_nfc.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/../piv/piv_crypto.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/../piv/piv_dispatch.c")
 list(APPEND CANOKEY_CORE_SRCS "${CMAKE_CURRENT_LIST_DIR}/../piv/piv_pin.c")
@@ -128,13 +132,16 @@ idf_component_register(
 
 target_compile_definitions(${COMPONENT_LIB}
     PUBLIC
-        ENABLE_NFC=0
-        ENABLE_APPLET_NDEF=0
+        ENABLE_NFC=1
+        NFC_CHIP=-1
+        ENABLE_APPLET_NDEF=1
+        NDEF_DEFAULT_EMPTY=0
         ENABLE_PASS=0
         ENABLE_IFACE_CTAPHID=1
         ENABLE_IFACE_WEBUSB=0
         ENABLE_IFACE_CCID=0
         ENABLE_IFACE_KBDHID=0
+        CTAP_NONE_ATTESTATION=1
          
     PRIVATE
         CBOR_NO_FLOATING_POINT
@@ -151,6 +158,8 @@ target_compile_options(${COMPONENT_LIB}
 
 target_link_options(${COMPONENT_LIB}
     INTERFACE
+        "-Wl,--wrap=CTAPHID_Loop"
+        "-Wl,--wrap=get_touch_result"
         "-Wl,--wrap=write_file"
         "-Wl,--wrap=read_file"
         "-Wl,--wrap=write_attr"

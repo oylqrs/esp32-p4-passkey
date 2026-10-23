@@ -5,6 +5,32 @@
 static ui_screen_show_cb_t s_back_stack[UI_NAV_STACK_DEPTH];
 static uint8_t s_back_stack_len;
 static ui_screen_show_cb_t s_root_screen;
+static ui_screen_show_cb_t s_pending_screen;
+
+static void show_pending_screen(void *user_data)
+{
+    (void)user_data;
+
+    ui_screen_show_cb_t screen = s_pending_screen;
+    s_pending_screen = NULL;
+    if (screen) {
+        screen();
+    }
+}
+
+static bool schedule_screen(ui_screen_show_cb_t screen)
+{
+    if (!screen || s_pending_screen) {
+        return false;
+    }
+
+    s_pending_screen = screen;
+    if (lv_async_call(show_pending_screen, NULL) != LV_RESULT_OK) {
+        s_pending_screen = NULL;
+        return false;
+    }
+    return true;
+}
 
 static void right_swipe_event_cb(lv_event_t *event)
 {
@@ -19,7 +45,7 @@ static void right_swipe_event_cb(lv_event_t *event)
 
 void ui_nav_push(ui_screen_show_cb_t current_screen, ui_screen_show_cb_t next_screen)
 {
-    if (!next_screen) {
+    if (!schedule_screen(next_screen)) {
         return;
     }
 
@@ -27,7 +53,6 @@ void ui_nav_push(ui_screen_show_cb_t current_screen, ui_screen_show_cb_t next_sc
         s_back_stack[s_back_stack_len++] = current_screen;
     }
 
-    next_screen();
 }
 
 void ui_nav_clear(void)
@@ -37,9 +62,8 @@ void ui_nav_clear(void)
 
 void ui_nav_replace(ui_screen_show_cb_t next_screen)
 {
-    ui_nav_clear();
-    if (next_screen) {
-        next_screen();
+    if (schedule_screen(next_screen)) {
+        ui_nav_clear();
     }
 }
 
@@ -55,12 +79,14 @@ void ui_nav_go_back(void)
         return;
     }
 
-    ui_screen_show_cb_t previous_screen = s_back_stack[--s_back_stack_len];
+    ui_screen_show_cb_t previous_screen = s_back_stack[s_back_stack_len - 1];
+    if (!schedule_screen(previous_screen)) {
+        return;
+    }
+
+    s_back_stack_len--;
     if (previous_screen == s_root_screen) {
         ui_nav_clear();
-    }
-    if (previous_screen) {
-        previous_screen();
     }
 }
 
@@ -72,4 +98,13 @@ void ui_nav_enable_right_swipe(lv_obj_t *screen)
 
     lv_obj_remove_event_cb(screen, right_swipe_event_cb);
     lv_obj_add_event_cb(screen, right_swipe_event_cb, LV_EVENT_GESTURE, NULL);
+}
+
+void ui_nav_disable_right_swipe(lv_obj_t *screen)
+{
+    if (!screen) {
+        return;
+    }
+
+    lv_obj_remove_event_cb(screen, right_swipe_event_cb);
 }
